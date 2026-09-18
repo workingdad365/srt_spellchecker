@@ -27,6 +27,20 @@ HARDSUB 추출 후 OCR로 생성한 파일이나, 맞춤법을 무시하고 제�
 
 ## 실행
 
+프로젝트 디렉터리에서 editable 방식으로 설치한다. 설치 후 소스 코드 변경 사항이 바로 반영된다.
+
+```powershell
+uv tool install --editable .
+```
+
+설치 후 어느 디렉터리에서든 명령으로 실행한다.
+
+```powershell
+srt-spellchecker <srt파일>
+```
+
+설치 없이 프로젝트 디렉터리에서 직접 실행할 수도 있다.
+
 ```powershell
 uv run srt_spellchecker.py <srt파일>
 ```
