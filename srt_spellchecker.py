@@ -185,6 +185,27 @@ def has_added_punctuation(original: str, revised: str) -> bool:
     return False
 
 
+def punctuation_review_details(
+    original: str, revised: str, source_lines: list[str], response_lines: list[str],
+) -> str:
+    added = punctuation_counter(revised) - punctuation_counter(original)
+    marks = ", ".join(
+        f"{json.dumps(mark, ensure_ascii=False)} (U+{ord(mark):04X}) +{count}개"
+        for mark, count in added.items()
+    )
+    details = [
+        f"  원본(교정 입력): {json.dumps(source_lines, ensure_ascii=False)}",
+        f"  모델 응답: {json.dumps(response_lines, ensure_ascii=False)}",
+        f"  추가 문장부호: {marks}",
+    ]
+    if original != "".join(source_lines) or revised != "".join(response_lines):
+        details.extend([
+            f"  검사 원본(정규화 후): {json.dumps(original, ensure_ascii=False)}",
+            f"  검사 응답(정규화 후): {json.dumps(revised, ensure_ascii=False)}",
+        ])
+    return "\n" + "\n".join(details)
+
+
 def violates_wrap_rules(lines: list[str], max_length: int) -> bool:
     return len(lines) > MAX_WRAPPED_LINES or any(len(line) > max_length for line in lines)
 
@@ -228,6 +249,8 @@ def sanitize_lines(
 ) -> tuple[list[str], list[str]]:
     """모델 교정 결과를 검증해 (확정 줄 목록, 검토 로그)를 반환한다."""
     notes: list[str] = []
+    source_lines = list(original_lines)
+    response_lines = list(corrected_lines)
     original_lines = [normalize_subtitle_punctuation(line) for line in original_lines]
     corrected_lines = [normalize_subtitle_punctuation(line) for line in corrected_lines]
 
@@ -252,7 +275,12 @@ def sanitize_lines(
             zip(original_lines, corrected_lines, strict=True), start=1
         ):
             if has_added_punctuation(original, revised):
-                notes.append(f"[되돌림] {number}번째 줄: 문장부호 추가 감지로 원본 유지")
+                notes.append(
+                    f"[되돌림] {number}번째 줄: 문장부호 추가 감지로 원본 유지"
+                    + punctuation_review_details(
+                        original, revised, [source_lines[number - 1]], [response_lines[number - 1]],
+                    )
+                )
                 result.append(original)
                 continue
             result.append(revised)
@@ -266,7 +294,10 @@ def sanitize_lines(
         notes.append("[되돌림] 빈 교정 결과로 원본 유지")
         lines = list(original_lines)
     elif has_added_punctuation("".join(original_lines), "".join(lines)):
-        notes.append("[되돌림] 문장부호 추가 감지로 원본 유지")
+        notes.append(
+            "[되돌림] 문장부호 추가 감지로 원본 유지"
+            + punctuation_review_details("".join(original_lines), "".join(lines), source_lines, response_lines)
+        )
         lines = list(original_lines)
 
     if violates_wrap_rules(lines, wrap_length):

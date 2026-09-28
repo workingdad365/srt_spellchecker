@@ -82,6 +82,36 @@ def test_has_added_punctuation() -> None:
     assert not sc.has_added_punctuation("안녕!!", "안녕!")
 
 
+@pytest.mark.parametrize("wrap_length", [None, 23])
+def test_punctuation_review_records_inputs_and_extra_counts(wrap_length) -> None:
+    lines, notes = sc.sanitize_lines(["안녕?"], ["안녕??!"], wrap_length)
+    assert lines == ["안녕?"]
+    assert len(notes) == 1
+    assert '원본(교정 입력): ["안녕?"]' in notes[0]
+    assert '모델 응답: ["안녕??!"]' in notes[0]
+    assert '"?" (U+003F) +1개' in notes[0]
+    assert '"!" (U+0021) +1개' in notes[0]
+
+
+def test_punctuation_review_distinguishes_normalization_and_unicode() -> None:
+    lines, notes = sc.sanitize_lines(["안녕.", "/정말?"], ["안녕!", "/정말？"], None)
+    assert lines == ["- 안녕", "- 정말?"]
+    assert '원본(교정 입력): ["안녕."]' in notes[0]
+    assert '모델 응답: ["안녕!"]' in notes[0]
+    assert '검사 원본(정규화 후): "- 안녕"' in notes[0]
+    assert '검사 응답(정규화 후): "- 안녕!"' in notes[0]
+    assert '"!" (U+0021) +1개' in notes[0]
+    assert "U+002D" not in notes[0]
+    assert '"？" (U+FF1F) +1개' in notes[1]
+
+
+def test_wrap_punctuation_review_preserves_response_line_boundaries() -> None:
+    lines, notes = sc.sanitize_lines(["안녕 하세요 반갑습니다"], ["안녕하세요", "반갑습니다!"], 23)
+    assert lines == ["안녕 하세요 반갑습니다"]
+    assert '모델 응답: ["안녕하세요", "반갑습니다!"]' in notes[0]
+    assert len(notes) == 1
+
+
 @pytest.mark.parametrize("mark", ["..", "...", "....", "......", "…", "……", "⋯", "‥", "︙", "︰", "．．", ".…."])
 def test_normalize_ellipsis(mark) -> None:
     assert sc.normalize_ellipsis(f"잠깐{mark} 기다려") == "잠깐... 기다려"
@@ -412,7 +442,9 @@ def test_revise_logs_revert_with_sequence_label() -> None:
 
     revised, logs = sc.revise_subtitles(sc.parse_srt_blocks(SAMPLE), FakeCorrector(responder))
     assert revised[0].text_lines == ["안녕 하세요"]
-    assert logs[0] == "[되돌림] 자막 #1: 1번째 줄: 문장부호 추가 감지로 원본 유지"
+    assert logs[0].startswith("[되돌림] 자막 #1: 1번째 줄: 문장부호 추가 감지로 원본 유지\n")
+    assert '원본(교정 입력): ["안녕 하세요"]' in logs[0]
+    assert '모델 응답: ["안녕 하세요!"]' in logs[0]
     assert len(logs) == 3
 
 

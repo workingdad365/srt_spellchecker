@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any, Literal
 
 from keyring.backend import KeyringBackend
 from pydantic import BaseModel, Field, ValidationError
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QIODevice, QSaveFile, QSettings, QStandardPaths
 
 from ai_services import ModelInfo
 from srt_spellchecker import DEFAULT_MAX_LINE_LENGTH
@@ -42,6 +43,18 @@ class Preferences(BaseModel):
     max_line_length: int = Field(default=DEFAULT_MAX_LINE_LENGTH, ge=1, le=200)
 
 
+class SavedWorkFile(BaseModel):
+    path: str = Field(min_length=1)
+    state: Literal["대기", "교정 중", "완료", "검토 필요", "실패", "중단"] = "대기"
+    output: str = ""
+    review_logs: list[str] = Field(default_factory=list)
+
+
+class SavedWorklist(BaseModel):
+    version: Literal[1] = 1
+    files: list[SavedWorkFile] = Field(default_factory=list)
+
+
 def native_credentials() -> KeyringBackend:
     if sys.platform == "win32":
         from keyring.backends.Windows import WinVaultKeyring
@@ -59,7 +72,35 @@ def native_credentials() -> KeyringBackend:
 class AppSettings:
     def __init__(self, store: QSettings | None = None) -> None:
         self.store = store if store is not None else QSettings("drasys", "srt-spellchecker")
+        self.worklist_path = (
+            Path(store.fileName() + ".worklist.json") if store is not None
+            else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericDataLocation))
+            / "srt-spellchecker" / "worklist.json"
+        )
         self._credentials: KeyringBackend | None = None
+
+    def load_worklist(self) -> SavedWorklist:
+        try:
+            return SavedWorklist.model_validate_json(self.worklist_path.read_bytes())
+        except FileNotFoundError:
+            return SavedWorklist()
+        except (OSError, ValidationError, ValueError):
+            raise SettingsError("저장된 작업 목록을 읽지 못했습니다. 작업 목록 파일을 확인하세요.") from None
+
+    def save_worklist(self, worklist: SavedWorklist) -> None:
+        try:
+            self.worklist_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            raise SettingsError("작업 목록 저장 폴더를 만들지 못했습니다.") from None
+        data = worklist.model_dump_json().encode("utf-8")
+        target = QSaveFile(str(self.worklist_path))
+        if not target.open(QIODevice.OpenModeFlag.WriteOnly):
+            raise SettingsError("작업 목록을 저장하지 못했습니다. 저장소 접근 권한을 확인하세요.")
+        if target.write(data) != len(data):
+            target.cancelWriting()
+            raise SettingsError("작업 목록을 모두 기록하지 못했습니다. 저장 공간을 확인하세요.")
+        if not target.commit():
+            raise SettingsError("작업 목록 저장을 완료하지 못했습니다. 이전 저장본을 유지합니다.")
 
     def load_preferences(self) -> Preferences:
         try:

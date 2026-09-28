@@ -24,6 +24,45 @@ class MemoryCredentials(KeyringBackend):
         del self.values[service, username]
 
 
+def test_worklist_round_trip_preserves_order_states_and_reviews(tmp_path) -> None:
+    store = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    assert store.load_worklist() == settings.SavedWorklist()
+    worklist = settings.SavedWorklist(files=[
+        settings.SavedWorkFile(
+            path=str(tmp_path / "한글 자막.srt"), state="검토 필요",
+            output=str(tmp_path / "한글 자막_revised.srt"), review_logs=["[되돌림] 자막 #13"],
+        ),
+        settings.SavedWorkFile(path=str(tmp_path / "next.srt"), state="교정 중"),
+    ])
+    store.save_worklist(worklist)
+    restored = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    assert restored.load_worklist() == worklist
+    store.save_worklist(settings.SavedWorklist())
+    assert restored.load_worklist().files == []
+
+
+@pytest.mark.parametrize("raw", ["not-json", '{"version":2}', '{"files":[{"path":"a.srt","state":"unknown"}]}'])
+def test_invalid_worklist_reports_error_without_overwriting(tmp_path, raw) -> None:
+    store = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    store.worklist_path.write_text(raw, encoding="utf-8")
+    with pytest.raises(settings.SettingsError, match="작업 목록"):
+        store.load_worklist()
+    assert store.worklist_path.read_text(encoding="utf-8") == raw
+
+
+@pytest.mark.parametrize("operation", ["open", "write", "commit"])
+def test_worklist_write_failure_preserves_previous_snapshot(tmp_path, monkeypatch, operation) -> None:
+    store = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    original = settings.SavedWorklist(files=[settings.SavedWorkFile(path=str(tmp_path / "saved.srt"))])
+    store.save_worklist(original)
+    previous = store.worklist_path.read_bytes()
+    monkeypatch.setattr(settings.QSaveFile, operation, lambda *_args: False if operation != "write" else -1)
+    with pytest.raises(settings.SettingsError):
+        store.save_worklist(settings.SavedWorklist())
+    assert store.worklist_path.read_bytes() == previous
+    assert store.load_worklist() == original
+
+
 def test_preferences_round_trip_preserves_model_metadata(tmp_path) -> None:
     path = str(tmp_path / "settings.ini")
     store = settings.AppSettings(QSettings(path, QSettings.Format.IniFormat))

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tomllib
+import subprocess
+import sys
 from pathlib import Path
 from threading import Event
 
@@ -9,8 +11,8 @@ import openai
 import pytest
 import shiboken6
 from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QPoint, QPointF, QSettings, QTimer, Qt, QUrl
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QMessageBox
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPalette
+from PySide6.QtWidgets import QApplication, QDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit
 
 import srt_spellchecker_gui as gui
 import app_settings
@@ -87,10 +89,54 @@ def test_version_matches_package_and_titles(window) -> None:
     project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == gui.__version__ == "1.1.2"
-    expected_title = "SRT Spellchecker v1.1.2"
+    assert project["project"]["version"] == gui.__version__ == "1.1.3"
+    expected_title = "SRT Spellchecker v1.1.3"
     assert window.windowTitle() == expected_title
     assert any(label.text() == expected_title for label in window.findChildren(QLabel))
+
+
+@pytest.mark.parametrize("dark", [False, True])
+@pytest.mark.parametrize("end_state", ["완료", "검토 필요", "실패", "중단", "대기"])
+def test_active_row_highlight_follows_file_state(window, tmp_path, dark, end_state) -> None:
+    palette = window.table.palette()
+    palette.setColor(QPalette.ColorRole.Base, QColor("#202020" if dark else "#ffffff"))
+    window.table.setPalette(palette)
+    window._files_loaded([tmp_path / "first.srt", tmp_path / "second.srt"])
+    window._file_state(0, "교정 중", "")
+    expected = "#214b3a" if dark else "#d9f2e7"
+    for column in range(window.table.columnCount()):
+        item = window.table.item(0, column)
+        assert item.background().color().name() == expected
+        assert item.font().bold()
+    assert not window.table.item(1, 0).font().bold()
+    for column in (3, 4):
+        assert expected in window.table.cellWidget(0, column).styleSheet()
+    window._file_state(0, end_state, "")
+    for column in range(window.table.columnCount()):
+        item = window.table.item(0, column)
+        assert item.data(Qt.ItemDataRole.BackgroundRole) is None
+        assert item.data(Qt.ItemDataRole.ForegroundRole) is None
+        assert not item.font().bold()
+    for column in (3, 4):
+        assert window.table.cellWidget(0, column).styleSheet() == ""
+    window._file_state(1, "교정 중", "")
+    assert window.table.item(1, 0).background().color().name() == expected
+    assert window.table.alternatingRowColors()
+
+
+@pytest.mark.parametrize("active_row", [0, 1])
+def test_active_row_background_is_rendered(window, app, tmp_path, active_row) -> None:
+    window._files_loaded([tmp_path / "first.srt", tmp_path / "second.srt"])
+    window.show()
+    window._file_state(active_row, "교정 중", "")
+    app.processEvents()
+    viewport = window.table.viewport()
+    image = viewport.grab().toImage()
+    scale = image.devicePixelRatio()
+    item = window.table.item(active_row, 0)
+    rect = window.table.visualItemRect(item)
+    rendered = image.pixelColor(int((rect.right() - 10) * scale), int((rect.bottom() - 6) * scale))
+    assert rendered == item.background().color()
 
 
 def test_default_state_and_model_selection(window) -> None:
@@ -104,6 +150,117 @@ def test_default_state_and_model_selection(window) -> None:
     window.model_combo.setCurrentIndex(0)
     window.key_edit.setText("different-secret")
     assert window.selected_model() is None
+
+
+def test_worklist_restores_without_closing_original_window(window, app, tmp_path, monkeypatch) -> None:
+    paths = [tmp_path / name for name in ("review.srt", "running.srt", "waiting.srt")]
+    window._files_loaded(paths)
+    output = str(tmp_path / "review_revised.srt")
+    logs = [
+        '[되돌림] 자막 #13: 원본 유지\n'
+        '  원본(교정 입력): ["안녕"]\n'
+        '  모델 응답: ["안녕?"]\n'
+        '  추가 문장부호: "?" (U+003F) +1개'
+    ]
+    window._store_review(paths[0], output, logs)
+    window._file_state(0, "검토 필요", output)
+    window._file_state(1, "교정 중", "")
+    restored = gui.MainWindow()
+    try:
+        assert restored.paths == paths
+        assert restored.table.item(0, 1).text() == "검토 필요"
+        assert restored.table.item(0, 2).toolTip() == output
+        assert restored.review_results[paths[0]] == (output, logs)
+        assert restored.table.cellWidget(0, 3).isEnabled()
+        assert paths[0] in restored.completed_paths
+        assert restored.table.item(1, 1).text() == "대기"
+        assert restored.table.item(2, 1).text() == "대기"
+        assert restored.worker is None
+        processed = []
+
+        def correct_file(path, *_args, **_kwargs):
+            processed.append(path)
+            return path.with_stem(path.stem + "_revised"), []
+
+        monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+        monkeypatch.setattr(gui, "correct_file", correct_file)
+        prepare_model(restored)
+        restored.start_correction()
+        finish_work(restored, app)
+        assert processed == paths[1:]
+        assert restored.review_results[paths[0]] == (output, logs)
+        assert not restored.start_button.isEnabled()
+    finally:
+        restored.close()
+        restored.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("remove", ["clear", "waiting", "selected"])
+def test_cleared_worklist_stays_empty_after_restart(window, app, tmp_path, remove) -> None:
+    window._files_loaded([tmp_path / "subtitle.srt"])
+    if remove == "clear":
+        window.clear_files()
+    elif remove == "waiting":
+        window.remove_waiting_file(window.paths[0])
+    else:
+        window.table.selectRow(0)
+        window.remove_selected()
+    restored = gui.MainWindow()
+    try:
+        assert restored.paths == []
+        assert restored.table.rowCount() == 0
+    finally:
+        restored.close()
+        restored.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_worklist_survives_abrupt_process_exit(app, isolated_settings, tmp_path) -> None:
+    settings_path, _credentials = isolated_settings
+    source = tmp_path / "interrupted.srt"
+    script = """
+import os
+import sys
+from pathlib import Path
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication
+from app_settings import AppSettings
+from srt_spellchecker_gui import MainWindow
+
+application = QApplication([])
+settings = AppSettings(QSettings(sys.argv[1], QSettings.Format.IniFormat))
+settings.load_key = lambda service: None
+window = MainWindow(settings)
+window._files_loaded([Path(sys.argv[2])])
+window._file_state(0, "교정 중", "")
+os._exit(23)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(settings_path), str(source)],
+        cwd=Path(gui.__file__).parent, capture_output=True, timeout=20, check=False,
+    )
+    assert result.returncode == 23, result.stderr
+    restored = gui.MainWindow()
+    try:
+        assert restored.paths == [source]
+        assert restored.table.item(0, 1).text() == "대기"
+        assert restored.worker is None
+    finally:
+        restored.close()
+        restored.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_worklist_save_error_is_visible(window, tmp_path, monkeypatch) -> None:
+    def fail(_worklist):
+        raise app_settings.SettingsError("작업 목록 저장 실패")
+
+    monkeypatch.setattr(window.settings, "save_worklist", fail)
+    source = tmp_path / "subtitle.srt"
+    window._files_loaded([source])
+    assert window.paths == [source]
+    assert "작업 목록 저장 실패" in window.log_view.toPlainText()
 
 
 def test_service_switch_clears_models_and_keeps_separate_keys(window) -> None:
@@ -233,6 +390,130 @@ def test_new_files_do_not_repeat_completed_files(window, app, tmp_path, monkeypa
     window._files_loaded([first, second])
     assert window.paths == []
     assert not window.start_button.isEnabled()
+
+
+@pytest.mark.parametrize("during_correction", [False, True])
+def test_review_button_shows_only_selected_file_logs(window, app, tmp_path, monkeypatch, during_correction) -> None:
+    paths = [tmp_path / "first.srt", tmp_path / "second.srt"]
+    started = Event()
+    release = Event()
+    notes = {
+        paths[0]: [
+            '[되돌림] 자막 #13: 문장부호 추가\n'
+            '  원본(교정 입력): ["안녕"]\n'
+            '  모델 응답: ["안녕?"]\n'
+            '  추가 문장부호: "?" (U+003F) +1개',
+            "[확인필요] test-secret",
+        ],
+        paths[1]: ["[누락] 자막 #22: 원본 유지"],
+    }
+
+    def correct_file(path, *_args, **_kwargs):
+        if during_correction and path == paths[1]:
+            started.set()
+            assert release.wait(5)
+        return path.with_stem(path.stem + "_revised"), notes[path]
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    window._files_loaded(paths)
+    prepare_model(window)
+    window.start_correction()
+    try:
+        if during_correction:
+            wait_until(started.is_set)
+        else:
+            finish_work(window, app)
+        window.log_view.clear()
+        window.table.cellWidget(0, 3).click()
+        dialog = window.findChild(QDialog)
+        assert dialog is not None and dialog.isVisible()
+        assert not dialog.isModal()
+        details = dialog.findChild(QPlainTextEdit)
+        assert details.isReadOnly()
+        text = details.toPlainText()
+        assert str(paths[0]) in text
+        assert "first_revised.srt" in text
+        assert notes[paths[0]][0] in text
+        assert notes[paths[1]][0] not in text
+        assert "test-secret" not in text
+        assert "[API KEY]" in text
+        assert "test-secret" not in window.settings.worklist_path.read_text(encoding="utf-8")
+        assert not window.table.cellWidget(0, 4).isEnabled()
+        window.remove_waiting_file(paths[0])
+        assert paths[0] in window.paths
+        dialog.close()
+    finally:
+        release.set()
+    finish_work(window, app)
+
+
+@pytest.mark.parametrize("remove_all", [False, True])
+def test_remove_waiting_file_during_correction(window, app, tmp_path, monkeypatch, remove_all) -> None:
+    started = Event()
+    release = Event()
+    processed = []
+    paths = [tmp_path / name for name in ("first.srt", "second.srt", "third.srt")]
+    for path in paths:
+        path.write_text(SAMPLE, encoding="utf-8")
+
+    def correct_file(path, *_args, **_kwargs):
+        processed.append(path)
+        if path == paths[0]:
+            started.set()
+            assert release.wait(5)
+        return path.with_stem(path.stem + "_revised"), []
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    window._files_loaded(paths)
+    prepare_model(window)
+    window.start_correction()
+    try:
+        assert started.wait(5)
+        app.processEvents()
+        assert not window.table.cellWidget(0, 4).isEnabled()
+        window.remove_waiting_file(paths[0])
+        assert window.paths == paths
+        assert window.table.cellWidget(1, 4).isEnabled()
+        window.table.selectRow(1)
+        window.table.cellWidget(1, 4).click()
+        assert window.paths == [paths[0], paths[2]]
+        assert window.table.rowCount() == 2
+        if remove_all:
+            window.table.cellWidget(1, 4).click()
+            assert window.paths == paths[:1]
+    finally:
+        release.set()
+    finish_work(window, app)
+    expected = paths[:1] if remove_all else [paths[0], paths[2]]
+    assert processed == expected
+    assert all(path.read_text(encoding="utf-8") == SAMPLE for path in paths)
+    assert window.table.item(len(expected) - 1, 2).text() == expected[-1].stem + "_revised.srt"
+    assert f"저장 {len(expected)}개" in window.status_label.text()
+    assert window.progress_bar.value() == 1000
+
+
+def test_fatal_error_summary_includes_previous_completed_files(window, app, tmp_path, monkeypatch) -> None:
+    paths = [tmp_path / name for name in ("first.srt", "second.srt", "third.srt")]
+
+    def correct_file(path, *_args, **_kwargs):
+        if path == paths[1]:
+            response = httpx.Response(401, request=httpx.Request("POST", "https://example.test"))
+            raise openai.AuthenticationError("bad key", response=response, body=None)
+        return path.with_stem(path.stem + "_revised"), ["[되돌림] 자막 #13"]
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    window._files_loaded(paths)
+    prepare_model(window)
+    window.start_correction()
+    finish_work(window, app)
+    assert "저장 1개 (검토 1개), 실패 1개, 미처리 1개" in window.status_label.text()
+    assert window.table.cellWidget(0, 3).isEnabled()
+    assert not window.table.cellWidget(1, 3).isEnabled()
+    assert not window.table.cellWidget(1, 4).isEnabled()
+    assert window.table.cellWidget(2, 4).isEnabled()
 
 
 @pytest.mark.parametrize("stop", [None, "cancel", "auth"])
@@ -427,6 +708,7 @@ def test_cancel_inflight_request_keeps_source_and_next_file(window, app, tmp_pat
 
 @pytest.mark.parametrize(("width", "height"), [(720, 620), (980, 800)])
 def test_layout_fits_window(window, app, width, height) -> None:
+    window._files_loaded([Path("layout.srt")])
     window.resize(width, height)
     window.show()
     app.processEvents()
@@ -444,6 +726,10 @@ def test_layout_fits_window(window, app, width, height) -> None:
         bounds.append(rect)
     for index, first in enumerate(bounds):
         assert all(not first.intersects(second) for second in bounds[index + 1:])
+    for column in (3, 4):
+        button = window.table.cellWidget(0, column)
+        assert window.table.viewport().rect().contains(button.geometry())
+        assert button.width() >= 24 and button.height() >= 24
 
 
 def test_settings_restore_after_close(window, app, isolated_settings) -> None:
