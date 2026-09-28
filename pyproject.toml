@@ -1,7 +1,7 @@
 [project]
 name = "srt-spellchecker"
 version = "0.1.0"
-description = "SRT OCR 자막 맞춤법 교정기 (OpenAI)"
+description = "SRT OCR 자막 데스크톱 교정기 (OpenAI / OpenRouter)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,10 +9,15 @@ dependencies = [
     "openai>=2.0.0",
     "python-dotenv>=1.1.1",
     "pydantic>=2.11.7",
+    "pyside6>=6.11.2",
+    "keyring>=25.6.0",
 ]
 
 [project.scripts]
 srt-spellchecker = "srt_spellchecker:main"
+
+[project.gui-scripts]
+srt-spellchecker-gui = "srt_spellchecker_gui:main"
 
 [dependency-groups]
 dev = [
@@ -24,7 +29,7 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-only-include = ["srt_spellchecker.py"]
+only-include = ["srt_spellchecker.py", "ai_services.py", "srt_spellchecker_gui.py", "app_settings.py"]
 
 [tool.uv]
 package = true
@@ -32,3 +37,9 @@ package = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.pylint.main]
+extension-pkg-allow-list = ["PySide6"]
+
+[tool.pylint.typecheck]
+generated-members = ["connect"]

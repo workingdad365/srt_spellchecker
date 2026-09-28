@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import codecs
 from collections import Counter
+from collections.abc import Callable, Iterable
 import json
 import os
 import re
@@ -154,6 +155,23 @@ def chunked[T](items: list[T], size: int) -> list[list[T]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def normalize_ellipsis(text: str) -> str:
+    return re.sub(
+        r"[.\uff0e\u2025\u2026\u22ef\ufe19\ufe30]{2,}|[\u2025\u2026\u22ef\ufe19\ufe30]",
+        "...",
+        text,
+    )
+
+
+def normalize_subtitle_punctuation(text: str) -> str:
+    text = normalize_ellipsis(text)
+    return re.sub(
+        r"(?<!\.)\.(?=(?:\s|[\"'\u2019\u201d\u3009\u300b\u300d\u300f)\]}]|</[A-Za-z][^>]*>)*$)",
+        "",
+        text,
+    )
+
+
 def punctuation_counter(text: str) -> Counter[str]:
     return Counter(ch for ch in text if unicodedata.category(ch).startswith("P"))
 
@@ -191,6 +209,18 @@ def rewrap_lines(lines: list[str], max_length: int) -> list[str] | None:
     return best[1] if best else None
 
 
+def format_dialogue_lines(lines: list[str]) -> list[str]:
+    return ["- " + re.sub(r"^[-/]\s*", "", line.strip(), count=1) for line in lines]
+
+
+def is_two_speaker_dialogue(lines: list[str]) -> bool:
+    return (
+        len(lines) == 2
+        and re.match(r"^\s*[-/]\s*\S", lines[1]) is not None
+        and all(line[2:].strip() for line in format_dialogue_lines(lines))
+    )
+
+
 def sanitize_lines(
     original_lines: list[str],
     corrected_lines: list[str],
@@ -198,8 +228,21 @@ def sanitize_lines(
 ) -> tuple[list[str], list[str]]:
     """모델 교정 결과를 검증해 (확정 줄 목록, 검토 로그)를 반환한다."""
     notes: list[str] = []
+    original_lines = [normalize_subtitle_punctuation(line) for line in original_lines]
+    corrected_lines = [normalize_subtitle_punctuation(line) for line in corrected_lines]
 
-    if wrap_length is None:
+    dialogue = is_two_speaker_dialogue(original_lines)
+    if dialogue:
+        original_lines = format_dialogue_lines(original_lines)
+        if len(corrected_lines) != 2 or not all(
+            line[2:].strip() for line in format_dialogue_lines(corrected_lines)
+        ):
+            notes.append("[되돌림] 대사 구성 불일치로 대사 표기만 교정")
+            corrected_lines = original_lines
+        else:
+            corrected_lines = format_dialogue_lines(corrected_lines)
+
+    if wrap_length is None or dialogue:
         if len(corrected_lines) != len(original_lines):
             notes.append("[되돌림] 줄 수 불일치로 원본 유지")
             return original_lines, notes
@@ -213,6 +256,8 @@ def sanitize_lines(
                 result.append(original)
                 continue
             result.append(revised)
+        if dialogue and wrap_length is not None and violates_wrap_rules(result, wrap_length):
+            notes.append(f"[확인필요] {wrap_length}자 초과: 두 사람의 대사 구분 유지")
         return result, notes
 
     # 줄 나눔 모드는 줄 수가 달라질 수 있으므로 블록 단위로 검증한다.
@@ -280,7 +325,18 @@ def build_messages(
         "OCR로 생성된 SRT 자막 문장을 문맥에 맞게 교정한다. "
         "오타, 띄어쓰기, 잘못 인식된 글자를 자연스럽게 수정하되 원래 의미는 유지한다. "
         f"{line_rule}"
-        "문장부호를 임의로 추가하지 말아라. 특히 마침표(.)는 절대 추가하지 마라. "
+        "두 줄 중 둘째 줄이 / 또는 -로 시작하는 자막은 두 사람의 대사다. "
+        "각 대사 앞의 / 또는 - 표기를 '- ' (하이픈과 공백 한 칸)으로 통일하고, "
+        "첫째 줄에도 '- '를 붙인다. 이 대사 표기에 한해 하이픈 추가를 허용한다. "
+        "두 사람의 대사는 줄 길이 제한보다 화자 구분을 우선하여 반드시 두 줄로 유지하고 "
+        "서로 합치거나 다른 화자의 줄로 옮기지 않는다. "
+        "대사 구분 표식이 없는 일반 두 줄 자막을 임의로 두 사람의 대사로 바꾸지 않는다. "
+        "기존 말줄임표는 점 두 개(..), 연속된 점, 특수문자 표기 모두 점 세 개(...)로 통일한다. "
+        "한국어 자막의 문장 끝 마침표(.)는 생략한다. 원문에 있어도 제거하며 "
+        "따옴표나 닫는 서식 태그 앞의 문장 끝 마침표도 제거한다. "
+        "말줄임표(...)와 소수점, URL 및 약어 내부의 점은 마침표와 혼동하지 말고 유지한다. "
+        "대사 구분용 하이픈과 기존 말줄임표의 표기 통일 이외의 문장부호를 임의로 추가하지 말아라. "
+        "특히 원문에 없는 마침표나 말줄임표를 추가하지 마라. "
         "확신할 수 없는 줄은 원문을 그대로 반환한다. "
         "주어진 id를 빠짐없이 정확히 한 번씩 포함해야 한다."
     )
@@ -316,18 +372,23 @@ def correct_batch_with_retry(
     payload: list[dict[str, object]],
     wrap_length: int | None,
     attempt_limit: int = ATTEMPT_LIMIT,
+    *,
+    on_log: Callable[[str], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> list[CorrectionItem] | None:
     """배치를 교정한다. 재시도 후에도 실패하면 None을 반환한다."""
     for attempt in range(1, attempt_limit + 1):
+        check_cancelled(is_cancelled)
         try:
             return request_corrections(corrector, payload, wrap_length)
         except FATAL_API_ERRORS:
             raise
         except Exception as error:
-            print(
-                f"[경고] 배치 교정 실패 (시도 {attempt}/{attempt_limit}): {error}",
-                file=sys.stderr,
-            )
+            message = f"[경고] 배치 교정 실패 (시도 {attempt}/{attempt_limit}): {error}"
+            if on_log:
+                on_log(message)
+            else:
+                print(message, file=sys.stderr)
     return None
 
 
@@ -336,9 +397,19 @@ def revise_subtitles(
     corrector: Any,
     wrap_length: int | None = None,
     batch_size: int = BATCH_SIZE,
+    *,
+    on_log: Callable[[str], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> tuple[list[SubtitleBlock], list[str]]:
     """자막을 교정하고 (교정된 블록, 검토 로그)를 반환한다."""
     logs: list[str] = []
+    blocks = [
+        block.model_copy(update={
+            "text_lines": [normalize_subtitle_punctuation(line) for line in block.text_lines],
+        }) if block.is_subtitle else block
+        for block in blocks
+    ]
 
     target_ids = [
         i
@@ -354,12 +425,28 @@ def revise_subtitles(
     corrections: dict[int, list[str]] = {}
     batches = chunked(target_ids, batch_size)
     for batch_index, requested_ids in enumerate(batches, start=1):
-        print(f"교정 진행 중: 배치 {batch_index}/{len(batches)}")
+        check_cancelled(is_cancelled)
+        message = f"교정 진행 중: 배치 {batch_index}/{len(batches)}"
+        if on_log:
+            on_log(message)
+        else:
+            print(message)
         payload: list[dict[str, object]] = [
-            {"id": i, "lines": blocks[i].text_lines} for i in requested_ids
+            {
+                "id": i,
+                "lines": format_dialogue_lines(blocks[i].text_lines)
+                if is_two_speaker_dialogue(blocks[i].text_lines)
+                else blocks[i].text_lines,
+            }
+            for i in requested_ids
         ]
 
-        corrected = correct_batch_with_retry(corrector, payload, wrap_length)
+        corrected = correct_batch_with_retry(
+            corrector, payload, wrap_length, on_log=on_log, is_cancelled=is_cancelled,
+        )
+        check_cancelled(is_cancelled)
+        if on_progress:
+            on_progress(batch_index, len(batches))
         if corrected is None:
             logs.append(
                 f"[실패] 배치 {batch_index}: 자막 {label(requested_ids[0])}~"
@@ -397,6 +484,73 @@ def output_path_for(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}_revised{input_path.suffix}")
 
 
+class CorrectionCancelled(Exception):
+    pass
+
+
+def check_cancelled(is_cancelled: Callable[[], bool] | None) -> None:
+    if is_cancelled and is_cancelled():
+        raise CorrectionCancelled("교정이 중단되었습니다.")
+
+
+def collect_srt_files(
+    paths: Iterable[Path],
+    is_cancelled: Callable[[], bool] | None = None,
+) -> list[Path]:
+    found: set[Path] = set()
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for path in paths:
+        check_cancelled(is_cancelled)
+        path = path.resolve()
+        if path.is_dir():
+            for directory, _, names in os.walk(path, onerror=raise_walk_error):
+                check_cancelled(is_cancelled)
+                for name in names:
+                    candidate = Path(directory) / name
+                    if candidate.suffix.lower() == ".srt" and candidate.is_file():
+                        found.add(candidate.resolve())
+        elif path.is_file() and path.suffix.lower() == ".srt":
+            found.add(path)
+        elif not path.exists():
+            raise FileNotFoundError(f"입력 경로를 찾을 수 없습니다: {path}")
+    return sorted(found, key=lambda path: str(path).casefold())
+
+
+def correct_file(
+    input_path: Path,
+    corrector: Any,
+    wrap_length: int | None = None,
+    *,
+    overwrite: bool = False,
+    on_log: Callable[[str], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> tuple[Path, list[str]]:
+    check_cancelled(is_cancelled)
+    content, encoding = decode_srt(input_path.read_bytes())
+    blocks = parse_srt_blocks(content)
+    revised, logs = revise_subtitles(
+        blocks, corrector, wrap_length,
+        on_log=on_log, on_progress=on_progress, is_cancelled=is_cancelled,
+    )
+    check_cancelled(is_cancelled)
+    data = render_srt(revised, detect_newline(content)).encode(encoding)
+    output = output_path_for(input_path)
+    number = 1
+    while True:
+        try:
+            with output.open("wb" if overwrite else "xb") as stream:
+                stream.write(data)
+            break
+        except FileExistsError:
+            number += 1
+            output = input_path.with_name(f"{input_path.stem}_revised_{number}{input_path.suffix}")
+    return output, logs
+
+
 def run(argv: list[str] | None = None) -> Path:
     args = parse_args(argv)
     input_path: Path = args.srt_file
@@ -428,6 +582,11 @@ def run(argv: list[str] | None = None) -> Path:
 
 
 def main() -> None:
+    if len(sys.argv) == 1:
+        from srt_spellchecker_gui import main as gui_main
+
+        gui_main()
+        return
     try:
         run()
     except (FileNotFoundError, ValueError, UnicodeDecodeError, openai.APIError) as error:
