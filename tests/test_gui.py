@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from threading import Event
 
@@ -9,7 +10,7 @@ import pytest
 import shiboken6
 from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QPoint, QPointF, QSettings, QTimer, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
-from PySide6.QtWidgets import QApplication, QLineEdit, QMessageBox
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QMessageBox
 
 import srt_spellchecker_gui as gui
 import app_settings
@@ -43,33 +44,53 @@ def isolated_settings(tmp_path, monkeypatch):
 def window(app, isolated_settings):
     widget = gui.MainWindow()
     yield widget
-    if widget.worker is not None:
-        widget.worker.requestInterruption()
-        widget.worker.wait(5000)
-        app.processEvents()
+    widget.cancel_work()
+    for worker in (widget.worker, widget.file_loader):
+        if worker is not None:
+            worker.wait(5000)
+    app.processEvents()
     widget.close()
     widget.deleteLater()
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def finish_work(window, app) -> None:
-    if window.worker is not None:
+def wait_until(predicate) -> None:
+    if not predicate():
         loop = QEventLoop()
         timer = QTimer()
+        check = QTimer()
+        check.timeout.connect(lambda: loop.quit() if predicate() else None)
+        check.start(10)
         timer.setSingleShot(True)
         timer.timeout.connect(loop.quit)
-        window.worker.finished.connect(loop.quit)
         timer.start(5000)
         loop.exec()
+        check.stop()
         timer.stop()
+    assert predicate()
+
+
+def finish_work(window, app) -> None:
+    wait_until(lambda: window.worker is None and window.file_loader is None)
     app.processEvents()
     assert window.worker is None
+    assert window.file_loader is None
 
 
 def prepare_model(window) -> None:
     window.key_edit.setText("test-secret")
     window._models_loaded([ModelInfo("test-model")])
     window.model_combo.setCurrentIndex(0)
+
+
+def test_version_matches_package_and_titles(window) -> None:
+    project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with project_path.open("rb") as project_file:
+        project = tomllib.load(project_file)
+    assert project["project"]["version"] == gui.__version__ == "1.1.1"
+    expected_title = "SRT Spellchecker v1.1.1"
+    assert window.windowTitle() == expected_title
+    assert any(label.text() == expected_title for label in window.findChildren(QLabel))
 
 
 def test_default_state_and_model_selection(window) -> None:
@@ -177,7 +198,157 @@ def test_gui_correction_flow(window, app, tmp_path, monkeypatch) -> None:
     assert (tmp_path / "subtitle_revised.srt").read_text(encoding="utf-8") == SAMPLE
     assert window.progress_bar.value() == 1000
     assert "저장 1개" in window.status_label.text()
+    assert not window.start_button.isEnabled()
+    window.start_correction()
+    assert window.worker is None
+
+
+@pytest.mark.parametrize("logs", [[], ["[확인필요] 검토 대상"]])
+def test_new_files_do_not_repeat_completed_files(window, app, tmp_path, monkeypatch, logs) -> None:
+    processed = []
+
+    def correct_file(path, *_args, **_kwargs):
+        processed.append(path)
+        return path.with_stem(path.stem + "_revised"), logs
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    first = tmp_path / "first.srt"
+    second = tmp_path / "second.srt"
+    window._files_loaded([first])
+    prepare_model(window)
+    window.start_correction()
+    finish_work(window, app)
+    window._files_loaded([first, second])
     assert window.start_button.isEnabled()
+    window.start_correction()
+    finish_work(window, app)
+    assert processed == [first, second]
+    expected_state = "검토 필요" if logs else "완료"
+    assert window.table.item(0, 1).text() == expected_state
+    assert window.table.item(0, 2).text() == "first_revised.srt"
+    assert window.table.item(1, 1).text() == expected_state
+    assert not window.start_button.isEnabled()
+    window.clear_files()
+    window._files_loaded([first, second])
+    assert window.paths == []
+    assert not window.start_button.isEnabled()
+
+
+@pytest.mark.parametrize("stop", [None, "cancel", "auth"])
+def test_drop_during_correction_appends_to_queue(window, app, tmp_path, monkeypatch, stop) -> None:
+    started = Event()
+    release = Event()
+    processed = []
+    paths = [tmp_path / name for name in ("first.srt", "second.srt", "third.srt")]
+    for path in paths:
+        path.write_text(SAMPLE, encoding="utf-8")
+
+    def correct_file(path, *_args, **kwargs):
+        processed.append(path)
+        if path == paths[0]:
+            started.set()
+            assert release.wait(5)
+            if stop == "auth":
+                response = httpx.Response(401, request=httpx.Request("POST", "https://example.test"))
+                raise openai.AuthenticationError("bad key", response=response, body=None)
+        gui.check_cancelled(kwargs["is_cancelled"])
+        return path.with_stem(path.stem + "_revised"), []
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    window._files_loaded(paths[:2])
+    prepare_model(window)
+    window.start_correction()
+    try:
+        assert started.wait(5)
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(paths[2])), QUrl.fromLocalFile(str(paths[0]))])
+        enter = QDragEnterEvent(
+            QPoint(10, 10), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        drop = QDropEvent(
+            QPointF(10, 10), Qt.DropAction.CopyAction, mime,
+            Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        )
+        QApplication.sendEvent(window.table.viewport(), enter)
+        assert enter.isAccepted()
+        QApplication.sendEvent(window.table.viewport(), drop)
+        assert drop.isAccepted()
+        assert not window.start_button.isEnabled()
+        assert not window.remove_button.isEnabled()
+        assert not window.clear_button.isEnabled()
+        wait_until(lambda: window.file_loader is None)
+        assert window.paths == paths
+        assert window.table.item(2, 1).text() == "대기"
+        if stop == "cancel":
+            window.cancel_work()
+    finally:
+        release.set()
+    finish_work(window, app)
+    assert window.paths == paths
+    if stop is None:
+        assert processed == paths
+        assert all(window.table.item(row, 1).text() == "완료" for row in range(3))
+        assert window.progress_bar.value() == 1000
+        assert "저장 3개" in window.status_label.text()
+        assert not window.start_button.isEnabled()
+    else:
+        assert processed == paths[:1]
+        assert window.table.item(0, 1).text() == ("중단" if stop == "cancel" else "실패")
+        assert all(window.table.item(row, 1).text() == "대기" for row in (1, 2))
+        assert window.start_button.isEnabled()
+
+
+def test_queue_waits_for_slow_file_discovery(window, app, tmp_path, monkeypatch) -> None:
+    started = Event()
+    release = Event()
+    scanning = Event()
+    release_scan = Event()
+    processed = []
+    paths = [tmp_path / name for name in ("first.srt", "second.srt", "third.srt")]
+    for path in paths:
+        path.write_text(SAMPLE, encoding="utf-8")
+    collect = gui.collect_srt_files
+
+    def correct_file(path, *_args, **_kwargs):
+        processed.append(path)
+        if path == paths[0]:
+            started.set()
+            assert release.wait(5)
+        return path.with_stem(path.stem + "_revised"), []
+
+    def slow_collect(sources, is_cancelled):
+        scanning.set()
+        assert release_scan.wait(5)
+        return collect(sources, is_cancelled)
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    monkeypatch.setattr(gui, "collect_srt_files", slow_collect)
+    window._files_loaded(paths[:1])
+    prepare_model(window)
+    window.start_correction()
+    try:
+        assert started.wait(5)
+        window.add_paths(paths[1:2])
+        assert scanning.wait(5)
+        release.set()
+        wait_until(lambda: window.worker is None)
+        assert window.file_loader is not None
+        assert not window.start_button.isEnabled()
+        assert not window.settings_panel.isEnabled()
+        assert not window.clear_button.isEnabled()
+        window.add_paths(paths[2:])
+    finally:
+        release.set()
+        release_scan.set()
+    finish_work(window, app)
+    assert processed == paths
+    assert window.paths == paths
+    assert "저장 3개" in window.status_label.text()
+    assert not window.start_button.isEnabled()
 
 
 def test_file_error_does_not_stop_next_file(window, app, tmp_path, monkeypatch) -> None:
