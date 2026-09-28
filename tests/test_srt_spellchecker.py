@@ -80,6 +80,61 @@ def test_has_added_punctuation() -> None:
     assert sc.has_added_punctuation("안녕", "안녕.")
     assert not sc.has_added_punctuation("안녕?", "안녕?")
     assert not sc.has_added_punctuation("안녕!!", "안녕!")
+    assert not sc.has_added_punctuation("안녕 반가워", "안녕, 반가워")
+    assert sc.has_added_punctuation("안녕 반가워", "안녕, 반가워!")
+
+
+@pytest.mark.parametrize("wrap_length", [None, 80])
+@pytest.mark.parametrize(("original", "response"), [
+    ("주기는 뭘 줘요 마리아랑 식도 안올렸다고요", "주기는 뭘 줘요, 마리아랑 식도 안 올렸다고요"),
+    ("조금도 못 기다려주냐 인정머리 없는 놈아!", "조금도 못 기다려 주냐, 인정머리 없는 녀석아!"),
+])
+def test_added_comma_keeps_corrected_words(wrap_length, original, response) -> None:
+    lines, notes = sc.sanitize_lines([original], [response], wrap_length)
+    assert lines == [response]
+    assert notes == []
+
+
+@pytest.mark.parametrize("wrap_length", [None, 80])
+@pytest.mark.parametrize("response", ["안녕하세요, 반가워요?", "안녕하세요, 반가워요!", "안녕하세요， 반가워요"])
+def test_other_added_punctuation_still_reverts(wrap_length, response) -> None:
+    original = "안녕 하세요 반가워요"
+    lines, notes = sc.sanitize_lines([original], [response], wrap_length)
+    assert lines == [original]
+    assert len(notes) == 1
+    assert notes[0].startswith("[되돌림]")
+    assert "원본(교정 입력)" in notes[0]
+    assert "모델 응답" in notes[0]
+
+
+@pytest.mark.parametrize("wrap_length", [None, 23])
+def test_dialogue_accepts_commas_without_review(wrap_length) -> None:
+    lines, notes = sc.sanitize_lines(
+        ["네 맞아", "/안녕 하세요"], ["네, 맞아", "/안녕하세요"], wrap_length,
+    )
+    assert lines == ["- 네, 맞아", "- 안녕하세요"]
+    assert notes == []
+
+
+def test_wrap_accepts_comma_with_changed_line_count() -> None:
+    lines, notes = sc.sanitize_lines(["맞아요 정말 반갑 습니다"], ["맞아요,", "정말 반갑습니다"], 10)
+    assert lines == ["맞아요,", "정말 반갑습니다"]
+    assert notes == []
+
+
+@pytest.mark.parametrize("wrap_length", [None, 23])
+def test_revise_accepts_comma_without_review(wrap_length) -> None:
+    def responder(payload):
+        return ok([{"id": item["id"], "corrected_lines": ["네, 맞아요"]} for item in payload])
+
+    blocks = sc.parse_srt_blocks("1\n00:00:01,000 --> 00:00:02,000\n네 맞아 요\n")
+    revised, logs = sc.revise_subtitles(blocks, FakeCorrector(responder), wrap_length=wrap_length)
+    assert revised[0].text_lines == ["네, 맞아요"]
+    assert revised[0].timecode == blocks[0].timecode
+    assert logs == []
+    prompt = sc.build_messages([], wrap_length)[0][1]
+    assert "쉼표(,)는 추가할 수 있다" in prompt
+    assert "원문에 없는 물음표, 느낌표, 따옴표, 마침표나 말줄임표를 추가하지 마라" in prompt
 
 
 @pytest.mark.parametrize("wrap_length", [None, 23])

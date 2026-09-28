@@ -180,7 +180,7 @@ def has_added_punctuation(original: str, revised: str) -> bool:
     original_marks = punctuation_counter(original)
     revised_marks = punctuation_counter(revised)
     for mark, count in revised_marks.items():
-        if count > original_marks.get(mark, 0):
+        if mark != "," and count > original_marks.get(mark, 0):
             return True
     return False
 
@@ -370,7 +370,7 @@ def build_messages(
         f"{line_rule}"
         "두 줄 중 둘째 줄이 / 또는 -로 시작하는 자막은 두 사람의 대사다. "
         "각 대사 앞의 / 또는 - 표기를 '- ' (하이픈과 공백 한 칸)으로 통일하고, "
-        "첫째 줄에도 '- '를 붙인다. 이 대사 표기에 한해 하이픈 추가를 허용한다. "
+        "첫째 줄에도 '- '를 붙인다. "
         "두 사람의 대사는 줄 길이 제한보다 화자 구분을 우선하여 반드시 두 줄로 유지하고 "
         "서로 합치거나 다른 화자의 줄로 옮기지 않는다. "
         "대사 구분 표식이 없는 일반 두 줄 자막을 임의로 두 사람의 대사로 바꾸지 않는다. "
@@ -378,8 +378,9 @@ def build_messages(
         "한국어 자막의 문장 끝 마침표(.)는 생략한다. 원문에 있어도 제거하며 "
         "따옴표나 닫는 서식 태그 앞의 문장 끝 마침표도 제거한다. "
         "말줄임표(...)와 소수점, URL 및 약어 내부의 점은 마침표와 혼동하지 말고 유지한다. "
-        "대사 구분용 하이픈과 기존 말줄임표의 표기 통일 이외의 문장부호를 임의로 추가하지 말아라. "
-        "특히 원문에 없는 마침표나 말줄임표를 추가하지 마라. "
+        "문맥과 문장 구조에 필요한 쉼표(,)는 추가할 수 있다. 불필요하게 추가하거나 반복하지 않는다. "
+        "쉼표, 대사 구분용 하이픈과 기존 말줄임표의 표기 통일 이외의 문장부호는 추가하지 않는다. "
+        "특히 원문에 없는 물음표, 느낌표, 따옴표, 마침표나 말줄임표를 추가하지 마라. "
         "확신할 수 없는 줄은 원문을 그대로 반환한다. "
         "주어진 id를 빠짐없이 정확히 한 번씩 포함해야 한다."
     )
