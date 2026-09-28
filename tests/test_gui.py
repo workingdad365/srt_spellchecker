@@ -87,8 +87,8 @@ def test_version_matches_package_and_titles(window) -> None:
     project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == gui.__version__ == "1.1.1"
-    expected_title = "SRT Spellchecker v1.1.1"
+    assert project["project"]["version"] == gui.__version__ == "1.1.2"
+    expected_title = "SRT Spellchecker v1.1.2"
     assert window.windowTitle() == expected_title
     assert any(label.text() == expected_title for label in window.findChildren(QLabel))
 

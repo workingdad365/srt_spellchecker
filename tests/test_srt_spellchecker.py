@@ -295,6 +295,59 @@ def test_revise_normalizes_dialogue_payload_and_preserves_srt_structure() -> Non
     assert logs == []
 
 
+@pytest.mark.parametrize("wrap_length", [None, 23])
+def test_request_includes_language_normalization_rules(wrap_length) -> None:
+    class CheckingCorrector(FakeCorrector):
+        def invoke(self, messages):
+            system_prompt = messages[0][1]
+            assert "비속어와 욕설은 문맥에 맞는 순화어로" in system_prompt
+            assert "사투리의 어휘와 어미는 자연스러운 표준어로" in system_prompt
+            assert "원래 뜻과 감정, 존댓말과 반말의 구분을 유지" in system_prompt
+            assert "정상적인 단어나 고유명사를 바꾸지 않는다" in system_prompt
+            assert "대응 표현이 불확실하면 억지로 치환하지 않고 원문을 유지" in system_prompt
+            assert "한국식 한자 독음의 한글로 바꾼다" in system_prompt
+            assert "뜻풀이로 번역하거나 중국어·일본어 발음으로 음역하지 않는다" in system_prompt
+            assert "'주군(主君)'이나 '주군（主君）'" in system_prompt
+            assert "괄호와 내용을 그대로 유지한다" in system_prompt
+            assert "부연 표기만 보존하고 나머지는 독음으로 바꾼다" in system_prompt
+            assert "독음을 확신할 수 없으면 원문을 유지한다" in system_prompt
+            return super().invoke(messages)
+
+    corrector = CheckingCorrector(echo)
+    sc.revise_subtitles(sc.parse_srt_blocks(SAMPLE), corrector, wrap_length=wrap_length)
+    assert corrector.calls == 1
+
+
+@pytest.mark.parametrize("wrap_length", [None, 23])
+@pytest.mark.parametrize(("original_lines", "corrected_lines"), [
+    (["겁나 좋네"], ["정말 좋네"]),
+    (["뭐 하노?"], ["뭐 하니?"]),
+    (["그랬어유"], ["그랬어요"]),
+    (["겁나 좋네", "/뭐 하노?"], ["- 정말 좋네", "- 뭐 하니?"]),
+    (["主君"], ["주군"]),
+    (["主君을 모셔라"], ["주군을 모셔라"]),
+    (["주군(主君)을 모셔라"], ["주군(主君)을 모셔라"]),
+    (["주군（主君）을 모셔라"], ["주군（主君）을 모셔라"]),
+    (["주군(主君)과 主君"], ["주군(主君)과 주군"]),
+    (["主君을 모셔라", "/주군(主君)이 오신다"], ["- 주군을 모셔라", "- 주군(主君)이 오신다"]),
+])
+def test_revise_accepts_language_normalization_without_changing_structure(
+    wrap_length, original_lines, corrected_lines,
+) -> None:
+    source = "7\n00:00:01,000 --> 00:00:02,000\n" + "\n".join(original_lines) + "\n\n메모 블록\n"
+    original = sc.parse_srt_blocks(source)
+    corrector = FakeCorrector(lambda payload: ok([
+        {"id": payload[0]["id"], "corrected_lines": corrected_lines},
+    ]))
+    revised, logs = sc.revise_subtitles(original, corrector, wrap_length=wrap_length)
+    assert revised[0].text_lines == corrected_lines
+    assert revised[0].sequence == original[0].sequence
+    assert revised[0].timecode == original[0].timecode
+    assert revised[1] == original[1]
+    assert original[0].text_lines == original_lines
+    assert logs == []
+
+
 def test_revise_applies_corrections_and_skips_non_subtitle() -> None:
     def responder(payload: list[dict[str, Any]]) -> dict[str, Any]:
         return ok(
