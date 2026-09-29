@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import codecs
+import csv
 import tomllib
 import subprocess
 import sys
@@ -85,12 +87,189 @@ def prepare_model(window) -> None:
     window.model_combo.setCurrentIndex(0)
 
 
+def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / name for name in ("two.srt", "failed.srt", "ten.srt", "zero.srt")]
+    window._files_loaded(paths)
+    window._file_state(0, "완료", str(tmp_path / "two_revised.srt"))
+    correction_states = [window.table.item(row, 1).text() for row in range(4)]
+    window.mode_combo.setCurrentIndex(1)
+    assert window.start_button.isEnabled()
+    assert window.settings_panel.isHidden()
+    assert window.wrap_check.isHidden()
+    assert not window.export_button.isEnabled()
+    created = []
+    monkeypatch.setattr(gui, "create_spacer", lambda: created.append(1) or object())
+
+    def evaluate(path, spacer, **kwargs):
+        if path.name == "failed.srt":
+            raise ValueError("잘못된 자막")
+        return {
+            "two.srt": gui.EvaluationResult(2, 100),
+            "ten.srt": gui.EvaluationResult(10, 10000),
+            "zero.srt": gui.EvaluationResult(0, 500),
+        }[path.name]
+
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    window.start_correction()
+    assert not window.mode_combo.isEnabled()
+    assert not window.export_button.isEnabled()
+    finish_work(window, app)
+    assert created == [1]
+    table = window.evaluation_table
+    assert [table.item(row, 0).text() for row in range(4)] == ["ten.srt", "two.srt", "zero.srt", "failed.srt"]
+    assert [table.item(row, 2).text() for row in range(4)] == ["10", "2", "0", "—"]
+    assert [table.item(row, 3).text() for row in range(4)] == ["10000", "100", "500", "—"]
+    assert [table.item(row, 4).text() for row in range(4)] == ["1.00", "20.00", "0.00", "—"]
+    assert table.isSortingEnabled()
+    assert window.export_button.isEnabled()
+    table.sortItems(4, Qt.SortOrder.DescendingOrder)
+    assert [table.item(row, 0).text() for row in range(4)] == ["two.srt", "ten.srt", "zero.srt", "failed.srt"]
+    assert "오류 12건" in window.status_label.text()
+    assert [window.table.item(row, 1).text() for row in range(4)] == correction_states
+    assert window.paths == paths
+    window.start_correction()
+    finish_work(window, app)
+    assert table.item(0, 0).text() == "ten.srt"
+    window.mode_combo.setCurrentIndex(0)
+    assert window.evaluation_table.isHidden()
+    assert window.export_button.isHidden()
+    assert not window.settings_panel.isHidden()
+    assert window.table.item(0, 2).text() == "two_revised.srt"
+
+
+def test_evaluation_sorts_only_when_finished(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / "first.srt", tmp_path / "second.srt"]
+    window._files_loaded(paths)
+    window.mode_combo.setCurrentIndex(1)
+    entered, release = Event(), Event()
+    monkeypatch.setattr(gui, "create_spacer", object)
+
+    def evaluate(path, spacer, **kwargs):
+        if path == paths[1]:
+            entered.set()
+            release.wait(5)
+        return gui.EvaluationResult(10 if path == paths[1] else 2, 100)
+
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    window.start_correction()
+    try:
+        wait_until(entered.is_set)
+        assert window.evaluation_table.item(0, 0).text() == "first.srt"
+        assert not window.files_button.isEnabled()
+        assert not window.evaluation_table.isSortingEnabled()
+    finally:
+        release.set()
+        finish_work(window, app)
+    assert window.evaluation_table.item(0, 0).text() == "second.srt"
+
+
+def test_evaluation_frequency_rounding_and_empty_text(window):
+    table = window.evaluation_table
+    table.setRowCount(3)
+    window._evaluation_result(0, "완료", gui.EvaluationResult(1, 3000))
+    window._evaluation_result(1, "완료", gui.EvaluationResult(1, 3001))
+    window._evaluation_result(2, "완료", gui.EvaluationResult(0, 0))
+    assert [table.item(row, 4).text() for row in range(3)] == ["0.33", "0.33", "—"]
+    assert table.item(2, 3).text() == "0"
+    table.sortItems(4, Qt.SortOrder.DescendingOrder)
+    assert [table.item(row, 3).text() for row in range(3)] == ["3000", "3001", "0"]
+
+
+def prepare_csv_table(window):
+    window.mode_combo.setCurrentIndex(1)
+    table = window.evaluation_table
+    table.setRowCount(4)
+    for row, (name, state, result) in enumerate([
+        ('한글,"자막".srt', "완료", gui.EvaluationResult(10, 10000)),
+        ("빈도 높은 자막.srt", "완료", gui.EvaluationResult(2, 100)),
+        ("실패.srt", "실패", None),
+        ("중단.srt", "중단", None),
+    ]):
+        table.setItem(row, 0, gui.QTableWidgetItem(name))
+        window._evaluation_result(row, state, result)
+    table.sortItems(4, Qt.SortOrder.DescendingOrder)
+    window._update_controls()
+
+
+def test_export_csv_preserves_table_order_headers_and_values(window, tmp_path, monkeypatch):
+    prepare_csv_table(window)
+    path = tmp_path / "평가.csv"
+    monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(path), "CSV (*.csv)"))
+    window.export_button.click()
+    assert path.read_bytes().startswith(codecs.BOM_UTF8)
+    with path.open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.reader(file))
+    assert rows == [
+        ["평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수"],
+        ["빈도 높은 자막.srt", "완료", "2", "100", "20.00"],
+        ['한글,"자막".srt', "완료", "10", "10000", "1.00"],
+        ["실패.srt", "실패", "—", "—", "—"],
+        ["중단.srt", "중단", "—", "—", "—"],
+    ]
+    assert "CSV 저장 완료" in window.status_label.text()
+    window.clear_files()
+    assert not window.export_button.isEnabled()
+
+
+def test_export_csv_cancel_keeps_status(window, monkeypatch):
+    prepare_csv_table(window)
+    previous = window.status_label.text()
+    monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: ("", ""))
+    window.export_evaluation_csv()
+    assert window.status_label.text() == previous
+
+
+@pytest.mark.parametrize("failure", ["open", "write", "commit"])
+def test_export_csv_failure_preserves_existing_file(window, tmp_path, monkeypatch, failure):
+    prepare_csv_table(window)
+    path = tmp_path / "existing.csv"
+    path.write_text("existing", encoding="utf-8")
+    monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(path), "CSV (*.csv)"))
+    original_save_file = gui.QSaveFile
+
+    class FailingSaveFile(original_save_file):
+        def open(self, mode):
+            return False if failure == "open" else super().open(mode)
+
+        def write(self, data):
+            if failure == "write":
+                super().write(data[:10])
+                return 10
+            return super().write(data)
+
+        def commit(self):
+            return False if failure == "commit" else super().commit()
+
+    monkeypatch.setattr(gui, "QSaveFile", FailingSaveFile)
+    window.export_evaluation_csv()
+    assert path.read_text(encoding="utf-8") == "existing"
+    assert "CSV 저장 실패" in window.status_label.text()
+    assert window.export_button.isEnabled()
+
+
+def test_evaluation_worker_cancel_and_initialization_failure(app, tmp_path, monkeypatch):
+    worker = gui.EvaluationWorker([tmp_path / "one.srt", tmp_path / "two.srt"])
+    results, summaries = [], []
+    worker.file_result.connect(lambda *args: results.append(args))
+    worker.summary.connect(summaries.append)
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda *args, **kwargs: (_ for _ in ()).throw(gui.CorrectionCancelled()))
+    worker.run()
+    assert results == [(0, "평가 중", None), (0, "중단", None)]
+    assert "미처리 2개" in summaries[-1]
+    results.clear()
+    monkeypatch.setattr(gui, "create_spacer", lambda: (_ for _ in ()).throw(RuntimeError("초기화 실패")))
+    worker.run()
+    assert results == [(0, "실패", None), (1, "실패", None)]
+    assert "실패 2개" in summaries[-1]
+
+
 def test_version_matches_package_and_titles(window) -> None:
     project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == gui.__version__ == "1.1.3"
-    expected_title = "SRT Spellchecker v1.1.3"
+    assert project["project"]["version"] == gui.__version__ == "1.1.4"
+    expected_title = "SRT Spellchecker v1.1.4"
     assert window.windowTitle() == expected_title
     assert any(label.text() == expected_title for label in window.findChildren(QLabel))
 

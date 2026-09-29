@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
 import sys
 from collections.abc import Callable
@@ -7,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from PySide6.QtCore import QMimeData, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QIODevice, QMimeData, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
@@ -19,13 +21,14 @@ from PySide6.QtWidgets import (
 
 from ai_services import BASE_URLS, ModelInfo, ServiceCorrector, fetch_models, reasoning_label
 from app_settings import AppSettings, Preferences, SavedModel, SavedWorkFile, SavedWorklist, SettingsError
+from spacing_evaluation import EvaluationResult, create_spacer, evaluate_file
 from srt_spellchecker import (
     DEFAULT_MAX_LINE_LENGTH, FATAL_API_ERRORS, CorrectionCancelled,
     check_cancelled, collect_srt_files, correct_file,
 )
 
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 
 class FileTable(QTableWidget):
@@ -193,6 +196,67 @@ class CorrectionWorker(QThread):
             )
 
 
+class EvaluationNumberItem(QTableWidgetItem):
+    def __init__(self, value: int | float | None, *, decimals: int | None = None) -> None:
+        text = "—" if value is None else str(value) if decimals is None else f"{value:.{decimals}f}"
+        super().__init__(text)
+        self.setData(Qt.ItemDataRole.UserRole, value if value is not None else -1)
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        return self.data(Qt.ItemDataRole.UserRole) < other.data(Qt.ItemDataRole.UserRole)
+
+
+class EvaluationWorker(QThread):
+    file_result = Signal(int, str, object)
+    progress = Signal(int)
+    log = Signal(str)
+    summary = Signal(str)
+
+    def __init__(self, paths: list[Path], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.paths = list(paths)
+
+    def run(self) -> None:
+        completed = failed = errors = 0
+        try:
+            check_cancelled(self.isInterruptionRequested)
+            spacer = create_spacer()
+            for index, path in enumerate(self.paths):
+                check_cancelled(self.isInterruptionRequested)
+                self.file_result.emit(index, "평가 중", None)
+                try:
+                    result = evaluate_file(
+                        path, spacer, is_cancelled=self.isInterruptionRequested,
+                        on_progress=lambda done, total, row=index: self.progress.emit(
+                            int((row + done / total) / len(self.paths) * 1000)
+                        ),
+                    )
+                    completed += 1
+                    errors += result.error_count
+                    self.file_result.emit(index, "완료", result)
+                except CorrectionCancelled:
+                    self.file_result.emit(index, "중단", None)
+                    raise
+                except Exception as error:
+                    failed += 1
+                    self.file_result.emit(index, "실패", None)
+                    self.log.emit(f"[오류] {path}: {error}")
+                self.progress.emit(int((index + 1) / len(self.paths) * 1000))
+        except CorrectionCancelled:
+            pass
+        except Exception as error:
+            self.log.emit(f"[오류] Kiwi 초기화: {error}")
+            for index in range(len(self.paths)):
+                self.file_result.emit(index, "실패", None)
+            failed = len(self.paths)
+        finally:
+            state = "평가 중단" if self.isInterruptionRequested() else "평가 종료"
+            self.summary.emit(
+                f"{state}: 완료 {completed}개, 오류 {errors}건, 실패 {failed}개, "
+                f"미처리 {len(self.paths) - completed - failed}개"
+            )
+
+
 class MainWindow(QMainWindow):
     def __init__(self, settings: AppSettings | None = None) -> None:
         super().__init__()
@@ -270,6 +334,11 @@ class MainWindow(QMainWindow):
         heading.setFont(font)
         root.addWidget(heading)
 
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["LLM 교정", "간이평가"])
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        root.addWidget(self.mode_combo)
+
         self.settings_panel = QWidget()
         form = QFormLayout(self.settings_panel)
         form.setContentsMargins(0, 0, 0, 0)
@@ -332,12 +401,33 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._update_controls)
         self.table.cellDoubleClicked.connect(self.open_file_location)
         splitter.addWidget(self.table)
+        self.evaluation_table = QTableWidget(0, 5)
+        self.evaluation_table.setHorizontalHeaderLabels([
+            "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수",
+        ])
+        self.evaluation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.evaluation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.evaluation_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.evaluation_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        for column in (3, 4):
+            self.evaluation_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.evaluation_table.horizontalHeaderItem(3).setToolTip(
+            "평가 대상 본문의 문자 수: 공백·줄바꿈·서식 태그·줄 시작 대사 표식 제외, 문장부호 포함"
+        )
+        self.evaluation_table.horizontalHeaderItem(4).setToolTip(
+            "오류 수 ÷ 글자 수 × 1,000 (글자 수가 0이면 —). 평가 종료 후 제목을 눌러 정렬"
+        )
+        self.evaluation_table.setToolTip(
+            "Kiwi 추정치: 공백 삽입·삭제 위치당 1건. 전체 평가 종료 후 오류 수 내림차순 정렬. 열 제목으로 정렬 변경"
+        )
+        self.evaluation_table.hide()
+        splitter.addWidget(self.evaluation_table)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(10000)
         self.log_view.setMinimumHeight(80)
         splitter.addWidget(self.log_view)
-        splitter.setSizes([300, 140])
+        splitter.setSizes([300, 200, 140])
         root.addWidget(splitter, 1)
 
         options = QHBoxLayout()
@@ -353,6 +443,12 @@ class MainWindow(QMainWindow):
         options.addWidget(self.wrap_check)
         options.addWidget(self.length_spin)
         options.addStretch()
+        self.export_button = self._button(
+            "CSV 내보내기", QStyle.StandardPixmap.SP_DialogSaveButton, self.export_evaluation_csv,
+        )
+        self.export_button.setToolTip("평가 테이블의 열과 현재 정렬 순서를 그대로 CSV로 저장")
+        self.export_button.hide()
+        options.addWidget(self.export_button)
         self.start_button = self._button("교정 시작", QStyle.StandardPixmap.SP_MediaPlay, self.start_correction)
         self.cancel_button = self._button("중단", QStyle.StandardPixmap.SP_MediaStop, self.cancel_work)
         options.addWidget(self.start_button)
@@ -370,10 +466,25 @@ class MainWindow(QMainWindow):
         index = self.model_combo.findText(self.model_combo.currentText())
         return self.model_combo.itemData(index) if index >= 0 else None
 
+    def _mode_changed(self) -> None:
+        evaluation = self.mode_combo.currentIndex() == 1
+        self.settings_panel.setVisible(not evaluation)
+        self.wrap_check.setVisible(not evaluation)
+        self.length_spin.setVisible(not evaluation)
+        self.evaluation_table.setVisible(evaluation)
+        self.export_button.setVisible(evaluation)
+        for column in (1, 2, 3):
+            self.table.setColumnHidden(column, evaluation)
+        self.start_button.setText("평가 시작" if evaluation else "교정 시작")
+        self.progress_bar.setValue(0)
+        self.status_label.setText("간이평가 대기" if evaluation else "교정 대기")
+        self._update_controls()
+
     def _update_controls(self) -> None:
         busy = self.worker is not None or self.file_loader is not None or self._correction_active
         can_add = not self.close_pending and (self.worker is None or isinstance(self.worker, CorrectionWorker))
         self.settings_panel.setEnabled(not busy)
+        self.mode_combo.setEnabled(not busy)
         self.fetch_button.setEnabled(not busy and bool(self.key_edit.text().strip()))
         self.model_combo.setEnabled(not busy and self.model_combo.count() > 0)
         for widget in (self.files_button, self.folder_button, self.table):
@@ -382,10 +493,15 @@ class MainWindow(QMainWindow):
         self.length_spin.setEnabled(not busy and self.wrap_check.isChecked())
         self.remove_button.setEnabled(not busy and bool(self.table.selectedItems()))
         self.clear_button.setEnabled(not busy and bool(self.paths))
+        self.export_button.setEnabled(
+            not busy and self.mode_combo.currentIndex() == 1 and self.evaluation_table.rowCount() > 0
+        )
         self.start_button.setEnabled(
-            not busy and any(path not in self.completed_paths for path in self.paths)
-            and bool(self.key_edit.text().strip())
-            and self.selected_model() is not None
+            not busy and (
+                bool(self.paths) if self.mode_combo.currentIndex() == 1 else
+                any(path not in self.completed_paths for path in self.paths)
+                and bool(self.key_edit.text().strip()) and self.selected_model() is not None
+            )
         )
         self.cancel_button.setEnabled(any(
             worker is not None and not worker.isInterruptionRequested()
@@ -510,6 +626,9 @@ class MainWindow(QMainWindow):
         self.worker = None
         if worker is not None:
             worker.wait()
+            if isinstance(worker, EvaluationWorker):
+                self.evaluation_table.horizontalHeader().setSortIndicator(2, Qt.SortOrder.DescendingOrder)
+                self.evaluation_table.setSortingEnabled(True)
             if isinstance(worker, CorrectionWorker):
                 self._finished_count += len(worker.paths)
                 self._current_progress = 0
@@ -608,7 +727,7 @@ class MainWindow(QMainWindow):
         added = 0
         for path in paths:
             path = path.resolve()
-            if path in known or path in self.completed_paths:
+            if path in known or (path in self.completed_paths and self.mode_combo.currentIndex() == 0):
                 continue
             known.add(path)
             self.paths.append(path)
@@ -696,6 +815,7 @@ class MainWindow(QMainWindow):
             self.paths.clear()
             self.table.setRowCount(0)
             self.review_results.clear()
+            self.evaluation_table.setRowCount(0)
             self.progress_bar.setValue(0)
             self._update_controls()
             self._save_worklist()
@@ -707,6 +827,9 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
 
     def start_correction(self) -> None:
+        if self.mode_combo.currentIndex() == 1:
+            self.start_evaluation()
+            return
         model = self.selected_model()
         paths = [path for path in self.paths if path not in self.completed_paths]
         if (
@@ -726,6 +849,68 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(f"[모델] {self.current_service} / {model.id}")
         self.log_view.appendPlainText(f"[추론] {reasoning_label(self.current_service, model)}")
         self._advance_correction()
+
+    def start_evaluation(self) -> None:
+        if self.worker is not None or self.file_loader is not None or self._correction_active or not self.paths:
+            return
+        self.evaluation_table.setSortingEnabled(False)
+        self.evaluation_table.setRowCount(0)
+        for row, path in enumerate(self.paths):
+            self.evaluation_table.insertRow(row)
+            item = QTableWidgetItem(path.name)
+            item.setToolTip(str(path))
+            self.evaluation_table.setItem(row, 0, item)
+            self._evaluation_result(row, "대기", None)
+        self.progress_bar.setValue(0)
+        self.log_view.clear()
+        worker = EvaluationWorker(self.paths, self)
+        worker.file_result.connect(self._evaluation_result)
+        worker.progress.connect(self.progress_bar.setValue)
+        worker.log.connect(self.log_view.appendPlainText)
+        worker.summary.connect(self._summary)
+        self._start_worker(worker, "간이평가 중: Kiwi 준비 및 띄어쓰기 분석")
+
+    def _evaluation_result(self, row: int, state: str, result: EvaluationResult | None) -> None:
+        self.evaluation_table.setItem(row, 1, QTableWidgetItem(state))
+        self.evaluation_table.setItem(row, 2, EvaluationNumberItem(result.error_count if result else None))
+        self.evaluation_table.setItem(row, 3, EvaluationNumberItem(result.character_count if result else None))
+        self.evaluation_table.setItem(row, 4, EvaluationNumberItem(
+            result.errors_per_1000 if result else None, decimals=2,
+        ))
+
+    def export_evaluation_csv(self) -> None:
+        if not self.export_button.isEnabled():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "간이평가 CSV 저장", "간이평가.csv", "CSV (*.csv)",
+        )
+        if not path:
+            return
+        table = self.evaluation_table
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer)
+        writer.writerow([
+            table.horizontalHeaderItem(column).text() for column in range(table.columnCount())
+        ])
+        for row in range(table.rowCount()):
+            writer.writerow([
+                table.item(row, column).text() if table.item(row, column) is not None else ""
+                for column in range(table.columnCount())
+            ])
+        data = buffer.getvalue().encode("utf-8-sig")
+        output = QSaveFile(path)
+        try:
+            if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(output.errorString())
+            if output.write(data) != len(data):
+                raise OSError(output.errorString())
+            if not output.commit():
+                raise OSError(output.errorString())
+        except OSError as error:
+            output.cancelWriting()
+            self.show_error(f"CSV 저장 실패: {error}")
+            return
+        self._summary(f"CSV 저장 완료: {path} (자막 {table.rowCount()}개)")
 
     def _advance_correction(self) -> None:
         if not self._correction_active or self.worker is not None:
@@ -791,7 +976,10 @@ class MainWindow(QMainWindow):
             if worker is not None:
                 worker.requestInterruption()
         if self.worker is not None or self.file_loader is not None:
-            self.status_label.setText("중단 요청됨: 진행 중인 API 요청 종료 대기")
+            self.status_label.setText(
+                "중단 요청됨: 진행 중인 분석 종료 대기" if isinstance(self.worker, EvaluationWorker)
+                else "중단 요청됨: 진행 중인 API 요청 종료 대기"
+            )
             self._update_controls()
 
     def closeEvent(self, event: QCloseEvent) -> None:
