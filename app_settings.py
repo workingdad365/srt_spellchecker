@@ -41,6 +41,7 @@ class Preferences(BaseModel):
     models: dict[str, SavedModel] = Field(default_factory=dict)
     wrap: bool = False
     max_line_length: int = Field(default=DEFAULT_MAX_LINE_LENGTH, ge=1, le=200)
+    concurrent_files: int = Field(default=1, ge=1, le=32)
 
 
 class SavedWorkFile(BaseModel):

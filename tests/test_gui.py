@@ -6,7 +6,7 @@ import tomllib
 import subprocess
 import sys
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 import httpx
 import openai
@@ -49,7 +49,7 @@ def window(app, isolated_settings):
     widget = gui.MainWindow()
     yield widget
     widget.cancel_work()
-    for worker in (widget.worker, widget.file_loader):
+    for worker in (widget.worker, widget.file_loader, *widget.correction_workers.values()):
         if worker is not None:
             worker.wait(5000)
     app.processEvents()
@@ -75,10 +75,11 @@ def wait_until(predicate) -> None:
 
 
 def finish_work(window, app) -> None:
-    wait_until(lambda: window.worker is None and window.file_loader is None)
+    wait_until(lambda: window.worker is None and window.file_loader is None and not window.correction_workers and not window._correction_active)
     app.processEvents()
     assert window.worker is None
     assert window.file_loader is None
+    assert not window.correction_workers
 
 
 def prepare_model(window) -> None:
@@ -158,7 +159,7 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
     assert window.evaluation_table.isHidden()
     assert window.export_button.isHidden()
     assert not window.settings_panel.isHidden()
-    assert window.table.item(0, 2).text() == "two_revised.srt"
+    assert window.table.item(0, 2).text() == str(Path(tmp_path.name) / "two_revised.srt")
 
 
 def test_evaluation_sorts_only_when_finished(window, app, tmp_path, monkeypatch):
@@ -554,13 +555,173 @@ def test_gui_correction_flow(window, app, tmp_path, monkeypatch) -> None:
     assert not window.start_button.isEnabled()
     finish_work(window, app)
     assert window.table.item(0, 1).text() == "완료"
-    assert window.table.item(0, 2).text() == "subtitle_revised.srt"
+    assert window.table.item(0, 0).text() == str(Path(tmp_path.name) / "subtitle.srt")
+    assert window.table.item(0, 2).text() == str(Path(tmp_path.name) / "subtitle_revised.srt")
     assert (tmp_path / "subtitle_revised.srt").read_text(encoding="utf-8") == SAMPLE
     assert window.progress_bar.value() == 1000
     assert "저장 1개" in window.status_label.text()
     assert not window.start_button.isEnabled()
     window.start_correction()
     assert window.worker is None
+
+
+@pytest.mark.parametrize("limit", [2, 3])
+def test_concurrent_correction_limit_refill_and_progress(window, app, tmp_path, monkeypatch, limit):
+    paths = [tmp_path / f"{index}.srt" for index in range(limit + 2)]
+    entered = {path: Event() for path in paths}
+    release = {path: Event() for path in paths}
+    clients, closed, active = [], [], set()
+    lock = Lock()
+    peak = 0
+
+    class Service(EchoService):
+        def __init__(self, *args):
+            super().__init__(*args)
+            clients.append(self)
+
+        def close(self):
+            closed.append(self)
+
+    def correct_file(path, corrector, *_args, **kwargs):
+        nonlocal peak
+        with lock:
+            active.add(path)
+            peak = max(peak, len(active))
+        kwargs["on_log"]("테스트 배치")
+        kwargs["on_progress"](1, 2)
+        entered[path].set()
+        try:
+            assert release[path].wait(10)
+            return path.with_stem(path.stem + "_revised"), [f"[검토] {path.name}"]
+        finally:
+            with lock:
+                active.remove(path)
+
+    monkeypatch.setattr(gui, "ServiceCorrector", Service)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    window._files_loaded(paths)
+    prepare_model(window)
+    window.concurrency_spin.setValue(limit)
+    window.start_correction()
+    try:
+        wait_until(lambda: all(entered[path].is_set() for path in paths[:limit]))
+        wait_until(lambda: window.progress_bar.value() == int(limit * 500 / len(paths)))
+        assert len(window.correction_workers) == limit
+        assert not entered[paths[limit]].is_set()
+        assert not window.concurrency_spin.isEnabled()
+        assert not window.correction_radio.isEnabled()
+        release[paths[0]].set()
+        wait_until(entered[paths[limit]].is_set)
+        assert any(not release[path].is_set() for path in paths[1:limit])
+        assert window.table.item(0, 1).text() == "검토 필요"
+        assert f"[{paths[0]}] 테스트 배치" in window.log_view.toPlainText()
+    finally:
+        for event in release.values():
+            event.set()
+        finish_work(window, app)
+    assert peak == limit
+    assert len(clients) == len(paths) == len(closed)
+    assert len({id(client) for client in clients}) == len(paths)
+    assert window.progress_bar.value() == 1000
+    for row, path in enumerate(paths):
+        assert window.table.item(row, 2).text() == str(Path(path.parent.name) / (path.stem + "_revised.srt"))
+        assert window.review_results[path][1] == [f"[검토] {path.name}"]
+    assert f"저장 {len(paths)}개" in window.status_label.text()
+
+
+@pytest.mark.parametrize("stop", ["cancel", "close", "auth"])
+def test_concurrent_stop_waits_for_all_running_files(window, app, tmp_path, monkeypatch, stop):
+    paths = [tmp_path / f"{index}.srt" for index in range(3)]
+    entered = {path: Event() for path in paths}
+    release = {path: Event() for path in paths}
+
+    def correct_file(path, *_args, **kwargs):
+        entered[path].set()
+        assert release[path].wait(10)
+        if stop == "auth" and path == paths[0]:
+            response = httpx.Response(401, request=httpx.Request("POST", "https://example.test"))
+            raise openai.AuthenticationError("bad key", response=response, body=None)
+        gui.check_cancelled(kwargs["is_cancelled"])
+        return path.with_stem(path.stem + "_revised"), []
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    window._files_loaded(paths)
+    prepare_model(window)
+    window.concurrency_spin.setValue(2)
+    window.start_correction()
+    try:
+        wait_until(lambda: entered[paths[0]].is_set() and entered[paths[1]].is_set())
+        if stop == "auth":
+            release[paths[0]].set()
+            wait_until(lambda: not window._correction_active)
+        elif stop == "close":
+            monkeypatch.setattr(gui.QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+            window.close()
+            assert window.close_pending
+        else:
+            window.cancel_work()
+        assert window.correction_workers
+        assert all(worker.isInterruptionRequested() for worker in window.correction_workers.values())
+        assert not entered[paths[2]].is_set()
+        assert not window.start_button.isEnabled()
+    finally:
+        for event in release.values():
+            event.set()
+        finish_work(window, app)
+    assert not entered[paths[2]].is_set()
+    assert window.table.item(0, 1).text() == ("실패" if stop == "auth" else "중단")
+    assert window.table.item(1, 1).text() == "중단"
+    assert window.table.item(2, 1).text() == "대기"
+
+
+def test_concurrent_queue_add_and_remove(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / f"{index}.srt" for index in range(4)]
+    for path in paths:
+        path.write_text(SAMPLE, encoding="utf-8")
+    entered = {path: Event() for path in paths}
+    release = Event()
+
+    def correct_file(path, *_args, **kwargs):
+        entered[path].set()
+        assert release.wait(10)
+        return path.with_stem(path.stem + "_revised"), []
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    window._files_loaded(paths[:2])
+    prepare_model(window)
+    window.concurrency_spin.setValue(2)
+    window.start_correction()
+    try:
+        wait_until(lambda: all(entered[path].is_set() for path in paths[:2]))
+        window.add_paths(paths[2:])
+        wait_until(lambda: window.file_loader is None)
+        window.remove_waiting_file(paths[1])
+        assert paths[1] in window.paths
+        window.remove_waiting_file(paths[2])
+        assert paths[2] not in window.paths
+    finally:
+        release.set()
+        finish_work(window, app)
+    assert not entered[paths[2]].is_set()
+    assert entered[paths[3]].is_set()
+    assert window.table.item(2, 2).text() == str(Path(tmp_path.name) / "3_revised.srt")
+    assert window.progress_bar.value() == 1000
+
+
+def test_correction_initialization_failure_marks_file_and_stops_queue(window, app, tmp_path, monkeypatch):
+    def fail(*args):
+        raise RuntimeError("연결 초기화 실패")
+
+    monkeypatch.setattr(gui, "ServiceCorrector", fail)
+    window._files_loaded([tmp_path / "first.srt", tmp_path / "second.srt"])
+    prepare_model(window)
+    window.start_correction()
+    finish_work(window, app)
+    assert window.table.item(0, 1).text() == "실패"
+    assert window.table.item(1, 1).text() == "대기"
+    assert "실패 1개, 미처리 1개" in window.status_label.text()
 
 
 @pytest.mark.parametrize("logs", [[], ["[확인필요] 검토 대상"]])
@@ -586,7 +747,7 @@ def test_new_files_do_not_repeat_completed_files(window, app, tmp_path, monkeypa
     assert processed == [first, second]
     expected_state = "검토 필요" if logs else "완료"
     assert window.table.item(0, 1).text() == expected_state
-    assert window.table.item(0, 2).text() == "first_revised.srt"
+    assert window.table.item(0, 2).text() == str(Path(tmp_path.name) / "first_revised.srt")
     assert window.table.item(1, 1).text() == expected_state
     assert not window.start_button.isEnabled()
     window.clear_files()
@@ -692,7 +853,9 @@ def test_remove_waiting_file_during_correction(window, app, tmp_path, monkeypatc
     expected = paths[:1] if remove_all else [paths[0], paths[2]]
     assert processed == expected
     assert all(path.read_text(encoding="utf-8") == SAMPLE for path in paths)
-    assert window.table.item(len(expected) - 1, 2).text() == expected[-1].stem + "_revised.srt"
+    assert window.table.item(len(expected) - 1, 2).text() == str(
+        Path(tmp_path.name) / (expected[-1].stem + "_revised.srt")
+    )
     assert f"저장 {len(expected)}개" in window.status_label.text()
     assert window.progress_bar.value() == 1000
 
@@ -821,7 +984,7 @@ def test_queue_waits_for_slow_file_discovery(window, app, tmp_path, monkeypatch)
         assert not window.loading_panel.isHidden()
         assert window.progress_bar.maximum() == 1000
         release.set()
-        wait_until(lambda: window.worker is None)
+        wait_until(lambda: not window.correction_workers)
         assert window.file_loader is not None
         assert not window.start_button.isEnabled()
         assert not window.settings_panel.isEnabled()
@@ -993,6 +1156,7 @@ def test_settings_restore_after_close(window, app, isolated_settings) -> None:
     window.model_combo.setCurrentIndex(0)
     window.wrap_check.setChecked(True)
     window.length_spin.setValue(32)
+    window.concurrency_spin.setValue(3)
     window.show_key.setChecked(True)
     window.close()
     restored = gui.MainWindow()
@@ -1003,6 +1167,7 @@ def test_settings_restore_after_close(window, app, isolated_settings) -> None:
         assert "minimal" in restored.reasoning_note.text()
         assert restored.wrap_check.isChecked()
         assert restored.length_spin.value() == 32
+        assert restored.concurrency_spin.value() == 3
         assert restored.key_edit.echoMode() == QLineEdit.EchoMode.Password
         restored.service_combo.setCurrentText("OpenAI")
         assert restored.selected_model().id == "test-model"
@@ -1019,10 +1184,12 @@ def test_preferences_save_before_close(window) -> None:
     prepare_model(window)
     window.wrap_check.setChecked(True)
     window.length_spin.setValue(40)
+    window.concurrency_spin.setValue(2)
     saved = window.settings.load_preferences()
     assert saved.models["OpenAI"].id == "test-model"
     assert saved.wrap is True
     assert saved.max_line_length == 40
+    assert saved.concurrent_files == 2
 
 
 def test_key_edit_saves_and_clears_credentials(window) -> None:

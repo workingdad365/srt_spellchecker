@@ -189,10 +189,12 @@ class CorrectionWorker(QThread):
                     raise
                 except Exception as error:
                     failed += 1
+                    fatal = isinstance(error, FATAL_API_ERRORS)
+                    if fatal:
+                        self.aborted = True
                     self.file_state.emit(index, "실패", "")
                     self.write_log(f"[오류] {path}: {error}")
-                    if isinstance(error, FATAL_API_ERRORS):
-                        self.aborted = True
+                    if fatal:
                         break
                 self.progress.emit(int((index + 1) / len(self.paths) * 1000))
         except CorrectionCancelled:
@@ -201,6 +203,9 @@ class CorrectionWorker(QThread):
         except Exception as error:
             self.aborted = True
             self.write_log(f"[오류] {error}")
+            for index in range(completed + failed, len(self.paths)):
+                self.file_state.emit(index, "실패", "")
+                failed += 1
         finally:
             if corrector is not None:
                 corrector.close()
@@ -288,13 +293,14 @@ class MainWindow(QMainWindow):
         self.completed_paths: set[Path] = set()
         self.review_results: dict[Path, tuple[str, list[str]]] = {}
         self.worker: QThread | None = None
+        self.correction_workers: dict[Path, CorrectionWorker] = {}
+        self._file_progress: dict[Path, int] = {}
+        self._correction_stop_reason = "작업 종료"
         self.file_loader: FileDiscoveryTask | None = None
         self._file_requests: list[list[Path]] = []
         self._correction_active = False
         self._session_paths: list[Path] = []
         self._attempted_paths: set[Path] = set()
-        self._finished_count = 0
-        self._current_progress = 0
         self.close_pending = False
         self.keys: dict[str, str] = {}
         for service in BASE_URLS:
@@ -322,6 +328,7 @@ class MainWindow(QMainWindow):
         self.key_edit.setText(self.keys[self.current_service])
         self.wrap_check.setChecked(self.preferences.wrap)
         self.length_spin.setValue(self.preferences.max_line_length)
+        self.concurrency_spin.setValue(self.preferences.concurrent_files)
         self._restore_model()
         try:
             self._restore_worklist()
@@ -401,6 +408,12 @@ class MainWindow(QMainWindow):
         self.reasoning_note = QLabel("미선택")
         self.reasoning_note.setWordWrap(True)
         form.addRow("추론", self.reasoning_note)
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, 32)
+        self.concurrency_spin.setSuffix(" 개")
+        self.concurrency_spin.setToolTip("동시에 교정할 파일 수. 1개는 순차 처리, 변경값은 다음 교정부터 적용")
+        self.concurrency_spin.valueChanged.connect(self._save_preferences)
+        form.addRow("동시 교정 파일 수", self.concurrency_spin)
         root.addWidget(self.settings_panel)
 
         tools = QHBoxLayout()
@@ -518,8 +531,8 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _update_controls(self) -> None:
-        busy = self.worker is not None or self.file_loader is not None or self._correction_active
-        can_add = not self.close_pending and (self.worker is None or isinstance(self.worker, CorrectionWorker))
+        busy = bool(self.worker or self.file_loader or self._correction_active or self.correction_workers)
+        can_add = not self.close_pending and self.worker is None
         self.settings_panel.setEnabled(not busy)
         self.correction_radio.setEnabled(not busy)
         self.evaluation_radio.setEnabled(not busy)
@@ -543,7 +556,7 @@ class MainWindow(QMainWindow):
         )
         self.cancel_button.setEnabled(any(
             worker is not None and not worker.isInterruptionRequested()
-            for worker in (self.worker, self.file_loader)
+            for worker in (self.worker, self.file_loader, *self.correction_workers.values())
         ))
         self.count_label.setText(f"자막 {len(self.paths)}개")
         for row, path in enumerate(self.paths):
@@ -554,7 +567,7 @@ class MainWindow(QMainWindow):
         self.table.cellWidget(row, 3).setEnabled(state == "검토 필요" and path in self.review_results)
         self.table.cellWidget(row, 4).setEnabled(
             state == "대기" and not self.close_pending
-            and (self.worker is None or isinstance(self.worker, CorrectionWorker))
+            and self.worker is None
         )
 
     def _service_changed(self, service: str) -> None:
@@ -632,6 +645,7 @@ class MainWindow(QMainWindow):
             return
         self.preferences.wrap = self.wrap_check.isChecked()
         self.preferences.max_line_length = self.length_spin.value()
+        self.preferences.concurrent_files = self.concurrency_spin.value()
         try:
             self.settings.save_preferences(self.preferences)
         except SettingsError as error:
@@ -667,18 +681,12 @@ class MainWindow(QMainWindow):
             if isinstance(worker, EvaluationWorker):
                 self.evaluation_table.horizontalHeader().setSortIndicator(2, Qt.SortOrder.DescendingOrder)
                 self.evaluation_table.setSortingEnabled(True)
-            if isinstance(worker, CorrectionWorker):
-                self._finished_count += len(worker.paths)
-                self._current_progress = 0
-                if worker.aborted or worker.isInterruptionRequested():
-                    self._correction_active = False
-                    self._summarize_correction("중단" if worker.isInterruptionRequested() else "작업 종료")
             if worker.isInterruptionRequested():
                 self.status_label.setText("작업 중단됨")
             worker.deleteLater()
         self._advance_correction()
         self._update_controls()
-        if self.close_pending and self.file_loader is None:
+        if self.close_pending and self.file_loader is None and not self.correction_workers:
             self.close()
 
     def show_error(self, message: str) -> None:
@@ -689,7 +697,7 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText("[오류] " + message)
 
     def load_models(self) -> None:
-        if self.worker is not None or self.file_loader is not None or not self.key_edit.text().strip():
+        if self.worker is not None or self.file_loader is not None or self._correction_active or self.correction_workers or not self.key_edit.text().strip():
             return
         self._save_current_key()
         service, api_key = self.current_service, self.key_edit.text().strip()
@@ -729,7 +737,7 @@ class MainWindow(QMainWindow):
     def add_paths(self, paths: list[Path]) -> None:
         if not paths or self.close_pending:
             return
-        if self.worker is not None and not isinstance(self.worker, CorrectionWorker):
+        if self.worker is not None:
             return
         self._file_requests.append(list(paths))
         self._load_next_files()
@@ -763,14 +771,14 @@ class MainWindow(QMainWindow):
         self.file_loader = None
         if worker is not None:
             worker.wait()
-            if worker.cancelled and self.worker is None:
+            if worker.cancelled and self.worker is None and not self.correction_workers:
                 self.status_label.setText("파일 불러오기 중단됨")
             worker.deleteLater()
         self._load_next_files()
         self.loading_panel.setVisible(self.file_loader is not None)
         self._advance_correction()
         self._update_controls()
-        if self.close_pending and self.worker is None and self.file_loader is None:
+        if self.close_pending and self.worker is None and self.file_loader is None and not self.correction_workers:
             self.close()
 
     def _files_loaded(self, paths: list[Path]) -> None:
@@ -784,7 +792,7 @@ class MainWindow(QMainWindow):
             self.paths.append(path)
             row = self.table.rowCount()
             self.table.insertRow(row)
-            item = QTableWidgetItem(path.name)
+            item = QTableWidgetItem(str(Path(path.parent.name) / path.name))
             item.setToolTip(str(path))
             self.table.setItem(row, 0, item)
             self.table.setItem(row, 1, QTableWidgetItem("대기"))
@@ -831,12 +839,12 @@ class MainWindow(QMainWindow):
     def remove_waiting_file(self, path: Path) -> None:
         if path not in self.paths or self.close_pending:
             return
-        if self.worker is not None and not isinstance(self.worker, CorrectionWorker):
+        if self.worker is not None:
             return
         row = self.paths.index(path)
         if self.table.item(row, 1).text() != "대기":
             return
-        if isinstance(self.worker, CorrectionWorker) and path in self.worker.paths:
+        if path in self.correction_workers:
             return
         del self.paths[row]
         self.table.removeRow(row)
@@ -845,13 +853,13 @@ class MainWindow(QMainWindow):
         self._attempted_paths.discard(path)
         self.review_results.pop(path, None)
         if self._correction_active:
-            self._update_progress(self._current_progress)
+            self._update_progress()
         self.log_view.appendPlainText(f"[대기열] 제거: {path}")
         self._update_controls()
         self._save_worklist()
 
     def remove_selected(self) -> None:
-        if self.worker is not None or self.file_loader is not None or self._correction_active:
+        if self.worker is not None or self.file_loader is not None or self._correction_active or self.correction_workers:
             return
         rows = sorted({item.row() for item in self.table.selectedItems()}, reverse=True)
         for row in rows:
@@ -862,7 +870,7 @@ class MainWindow(QMainWindow):
         self._save_worklist()
 
     def clear_files(self) -> None:
-        if self.worker is None and self.file_loader is None and not self._correction_active:
+        if self.worker is None and self.file_loader is None and not self._correction_active and not self.correction_workers:
             self.paths.clear()
             self.table.setRowCount(0)
             self.review_results.clear()
@@ -885,6 +893,7 @@ class MainWindow(QMainWindow):
         paths = [path for path in self.paths if path not in self.completed_paths]
         if (
             self.worker is not None or self.file_loader is not None or self._correction_active
+            or self.correction_workers
             or not paths or model is None or not self.key_edit.text().strip()
         ):
             return
@@ -892,17 +901,19 @@ class MainWindow(QMainWindow):
         self._correction_active = True
         self._session_paths = paths
         self._attempted_paths.clear()
-        self._finished_count = 0
+        self._file_progress.clear()
+        self._correction_stop_reason = "작업 종료"
         for path in paths:
             self._file_state(self.paths.index(path), "대기", "")
         self.progress_bar.setValue(0)
         self.log_view.clear()
         self.log_view.appendPlainText(f"[모델] {self.current_service} / {model.id}")
         self.log_view.appendPlainText(f"[추론] {reasoning_label(self.current_service, model)}")
+        self.log_view.appendPlainText(f"[동시 교정] 최대 {self.concurrency_spin.value()}개 파일")
         self._advance_correction()
 
     def start_evaluation(self) -> None:
-        if self.worker is not None or self.file_loader is not None or self._correction_active or not self.paths:
+        if self.worker is not None or self.file_loader is not None or self._correction_active or self.correction_workers or not self.paths:
             return
         self.evaluation_table.setSortingEnabled(False)
         self.evaluation_table.setRowCount(0)
@@ -966,30 +977,66 @@ class MainWindow(QMainWindow):
     def _advance_correction(self) -> None:
         if not self._correction_active or self.worker is not None:
             return
+        if any(worker.aborted for worker in self.correction_workers.values()):
+            self._stop_corrections("작업 종료")
+            return
         paths = [path for path in self._session_paths if path not in self._attempted_paths]
         if not paths:
-            if self.file_loader is None and not self._file_requests:
+            if not self.correction_workers and self.file_loader is None and not self._file_requests:
                 self._correction_active = False
                 self._summarize_correction("작업 종료")
+            elif self.correction_workers:
+                self.status_label.setText(f"교정 중: 동시 {len(self.correction_workers)}개 파일")
             return
         model = self.selected_model()
         if model is None:
             self._correction_active = False
             return
-        paths = paths[:1]
-        path = paths[0]
-        self._current_progress = 0
-        self._attempted_paths.update(paths)
+        available = self.concurrency_spin.value() - len(self.correction_workers)
+        for path in paths[:max(0, available)]:
+            self._start_correction_file(path, model)
+        self._update_progress()
+        self.status_label.setText(f"교정 중: 동시 {len(self.correction_workers)}개 파일")
+        self._update_controls()
+
+    def _start_correction_file(self, path: Path, model: ModelInfo) -> None:
+        self._attempted_paths.add(path)
+        self._file_progress[path] = 0
+        self.review_results.pop(path, None)
         self._file_state(self.paths.index(path), "교정 중", "")
         worker = CorrectionWorker(
-            paths, self.current_service, self.key_edit.text().strip(), model,
+            [path], self.current_service, self.key_edit.text().strip(), model,
             self.length_spin.value() if self.wrap_check.isChecked() else None, self,
         )
-        worker.log.connect(self.log_view.appendPlainText)
+        self.correction_workers[path] = worker
+        worker.log.connect(lambda message: self.log_view.appendPlainText(f"[{path}] {message}"))
         worker.file_state.connect(lambda _row, state, output: self._file_state(self.paths.index(path), state, output))
         worker.review_ready.connect(lambda _row, output, logs: self._store_review(path, output, logs))
-        worker.progress.connect(self._update_progress)
-        self._start_worker(worker, "교정 중")
+        worker.progress.connect(lambda value: self._update_progress(path, value))
+        worker.finished.connect(self._correction_finished)
+        worker.start()
+
+    def _stop_corrections(self, reason: str) -> None:
+        self._correction_active = False
+        self._correction_stop_reason = reason
+        for worker in self.correction_workers.values():
+            worker.requestInterruption()
+
+    def _correction_finished(self) -> None:
+        worker = self.sender()
+        path = worker.paths[0]
+        worker.wait()
+        del self.correction_workers[path]
+        if worker.aborted and self._correction_active:
+            self._stop_corrections("작업 종료")
+        worker.deleteLater()
+        if self._correction_active:
+            self._advance_correction()
+        elif not self.correction_workers:
+            self._summarize_correction(self._correction_stop_reason)
+        self._update_controls()
+        if self.close_pending and self.worker is None and self.file_loader is None and not self.correction_workers:
+            self.close()
 
     def _summarize_correction(self, state: str) -> None:
         states = [self.table.item(self.paths.index(path), 1).text() for path in self._session_paths]
@@ -1001,14 +1048,18 @@ class MainWindow(QMainWindow):
             f"미처리 {len(states) - completed - failed}개"
         )
 
-    def _update_progress(self, value: int) -> None:
-        self._current_progress = value
+    def _update_progress(self, path: Path | None = None, value: int = 0) -> None:
+        if path is not None:
+            self._file_progress[path] = value
         total = len(self._session_paths)
-        self.progress_bar.setValue(int((self._finished_count * 1000 + value) / total) if total else 0)
+        self.progress_bar.setValue(
+            int(sum(self._file_progress.get(path, 0) for path in self._session_paths) / total) if total else 0
+        )
 
     def _file_state(self, row: int, state: str, output: str) -> None:
         self.table.item(row, 1).setText(state)
-        self.table.item(row, 2).setText(Path(output).name if output else "")
+        output_path = Path(output)
+        self.table.item(row, 2).setText(str(Path(output_path.parent.name) / output_path.name) if output else "")
         self.table.item(row, 2).setToolTip(output)
         if state in {"완료", "검토 필요"}:
             self.completed_paths.add(self.paths[row])
@@ -1021,23 +1072,23 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(message)
 
     def cancel_work(self) -> None:
-        self._correction_active = False
+        self._stop_corrections("중단")
         self._file_requests.clear()
         for worker in (self.worker, self.file_loader):
             if worker is not None:
                 worker.requestInterruption()
         if self.file_loader is not None:
             self.loading_label.setText(self.loading_label.text().replace("파일 불러오는 중", "파일 탐색 중단 대기"))
-        if self.worker is not None or self.file_loader is not None:
+        if self.worker is not None or self.file_loader is not None or self.correction_workers:
             self.status_label.setText(
                 "중단 요청됨: 진행 중인 분석 종료 대기" if isinstance(self.worker, EvaluationWorker)
-                else "중단 요청됨: 파일 탐색 종료 대기" if self.worker is None
+                else "중단 요청됨: 파일 탐색 종료 대기" if self.worker is None and not self.correction_workers
                 else "중단 요청됨: 진행 중인 API 요청 종료 대기"
             )
             self._update_controls()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self.worker is not None or self.file_loader is not None:
+        if self.worker is not None or self.file_loader is not None or self.correction_workers:
             answer = QMessageBox.question(self, "작업 진행 중", "작업을 중단하고 창을 닫으시겠습니까?")
             if answer == QMessageBox.StandardButton.Yes:
                 self.close_pending = True

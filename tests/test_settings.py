@@ -71,7 +71,7 @@ def test_preferences_round_trip_preserves_model_metadata(tmp_path) -> None:
         "supported_parameters": ["structured_outputs"],
         "unused_field": "not saved",
     })
-    preferences = settings.Preferences(service="OpenRouter", wrap=True, max_line_length=30)
+    preferences = settings.Preferences(service="OpenRouter", wrap=True, max_line_length=30, concurrent_files=3)
     preferences.models["OpenRouter"] = settings.SavedModel.from_model(model)
     store.save_preferences(preferences)
     restored = settings.AppSettings(QSettings(path, QSettings.Format.IniFormat)).load_preferences()
@@ -112,7 +112,10 @@ def test_vault_failure_does_not_leak_secret_or_fallback(tmp_path, monkeypatch) -
         store.load_key("OpenAI")
 
 
-@pytest.mark.parametrize("raw", ["not-json", '{"service":"unknown"}', '{"max_line_length":0}'])
+@pytest.mark.parametrize("raw", [
+    "not-json", '{"service":"unknown"}', '{"max_line_length":0}',
+    '{"concurrent_files":0}', '{"concurrent_files":33}',
+])
 def test_invalid_preferences_report_error(tmp_path, raw) -> None:
     store = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
     store.store.setValue("preferences", raw)

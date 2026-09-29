@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 import codecs
-from collections import Counter
 from collections.abc import Callable, Iterable
 import json
+import math
 import os
+import random
 import re
 import sys
-from time import monotonic
-import unicodedata
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from time import monotonic, sleep
 from pathlib import Path
 from typing import Any
 
@@ -173,40 +175,6 @@ def normalize_subtitle_punctuation(text: str) -> str:
     )
 
 
-def punctuation_counter(text: str) -> Counter[str]:
-    return Counter(ch for ch in text if unicodedata.category(ch).startswith("P"))
-
-
-def has_added_punctuation(original: str, revised: str) -> bool:
-    original_marks = punctuation_counter(original)
-    revised_marks = punctuation_counter(revised)
-    for mark, count in revised_marks.items():
-        if mark != "," and count > original_marks.get(mark, 0):
-            return True
-    return False
-
-
-def punctuation_review_details(
-    original: str, revised: str, source_lines: list[str], response_lines: list[str],
-) -> str:
-    added = punctuation_counter(revised) - punctuation_counter(original)
-    marks = ", ".join(
-        f"{json.dumps(mark, ensure_ascii=False)} (U+{ord(mark):04X}) +{count}개"
-        for mark, count in added.items()
-    )
-    details = [
-        f"  원본(교정 입력): {json.dumps(source_lines, ensure_ascii=False)}",
-        f"  모델 응답: {json.dumps(response_lines, ensure_ascii=False)}",
-        f"  추가 문장부호: {marks}",
-    ]
-    if original != "".join(source_lines) or revised != "".join(response_lines):
-        details.extend([
-            f"  검사 원본(정규화 후): {json.dumps(original, ensure_ascii=False)}",
-            f"  검사 응답(정규화 후): {json.dumps(revised, ensure_ascii=False)}",
-        ])
-    return "\n" + "\n".join(details)
-
-
 def violates_wrap_rules(lines: list[str], max_length: int) -> bool:
     return len(lines) > MAX_WRAPPED_LINES or any(len(line) > max_length for line in lines)
 
@@ -231,16 +199,48 @@ def rewrap_lines(lines: list[str], max_length: int) -> list[str] | None:
     return best[1] if best else None
 
 
-def format_dialogue_lines(lines: list[str]) -> list[str]:
-    return ["- " + re.sub(r"^[-/]\s*", "", line.strip(), count=1) for line in lines]
+def expand_subtitle_lines(lines: list[str]) -> list[str]:
+    """실제 줄바꿈과 한국어 문장 뒤의 공백 슬래시 대사 표식을 분리한다."""
+    result: list[str] = []
+    for line in lines:
+        # 경로, 분수, 선택지 표기를 대사로 오인하지 않도록 문장 종결 뒤로 제한한다.
+        expanded = re.sub(
+            r"([가-힣]*(?:요|다|까|죠|지|네|어|아|야|해|돼|자)[.!?…]*)[ \t]+/(?=[ \t]*[가-힣])",
+            r"\1\n/", line,
+        )
+        result.extend(expanded.splitlines() or [""])
+    return result
 
 
-def is_two_speaker_dialogue(lines: list[str]) -> bool:
-    return (
-        len(lines) == 2
-        and re.match(r"^\s*[-/]\s*\S", lines[1]) is not None
-        and all(line[2:].strip() for line in format_dialogue_lines(lines))
-    )
+def subtitle_segments(lines: list[str]) -> list[list[str]]:
+    """대사 표식과 서식 줄의 경계를 보존하여 이어지는 일반 줄을 묶는다."""
+    segments: list[list[str]] = []
+    for line in lines:
+        marked = re.match(r"^\s*[-/]\s*\S", line) is not None
+        formatted = re.search(r"<[^>]+>|\{\\[^}]+\}", line) is not None
+        previous_formatted = bool(segments and re.search(r"<[^>]+>|\{\\[^}]+\}", segments[-1][-1]))
+        if not segments or marked or formatted or previous_formatted:
+            segments.append([line])
+        else:
+            segments[-1].append(line)
+    return segments
+
+
+def format_subtitle_segments(segments: list[list[str]]) -> list[str]:
+    dialogue = any(re.match(r"^\s*[-/]\s*\S", line) for group in segments for line in group)
+    result = []
+    for group in segments:
+        if dialogue and not any(re.search(r"<[^>]+>|\{\\[^}]+\}", line) for line in group):
+            result.append("- " + " ".join(re.sub(r"^[-/]\s*", "", line.strip(), count=1) for line in group))
+        else:
+            result.append(" ".join(line.strip() for line in group))
+    return result
+
+
+def prepare_subtitle_lines(lines: list[str]) -> list[str]:
+    expanded = expand_subtitle_lines(lines)
+    segments = subtitle_segments(expanded)
+    return format_subtitle_segments(segments) if len(segments) > 1 else expanded
 
 
 def sanitize_lines(
@@ -252,56 +252,71 @@ def sanitize_lines(
     notes: list[str] = []
     source_lines = list(original_lines)
     response_lines = list(corrected_lines)
+
+    def revert_note(reason: str) -> str:
+        details = [
+            f"[되돌림] {reason}",
+            f"  원본(검증 전, {len(source_lines)}줄): {json.dumps(source_lines, ensure_ascii=False)}",
+            f"  모델 응답({len(response_lines)}줄): {json.dumps(response_lines, ensure_ascii=False)}",
+        ]
+        if original_lines != source_lines:
+            details.append(
+                f"  검사 원본(정리 후, {len(original_lines)}줄): {json.dumps(original_lines, ensure_ascii=False)}"
+            )
+        if corrected_lines != response_lines:
+            details.append(
+                f"  검사 응답(정리 후, {len(corrected_lines)}줄): {json.dumps(corrected_lines, ensure_ascii=False)}"
+            )
+        return "\n".join(details)
+
     original_lines = [normalize_subtitle_punctuation(line) for line in original_lines]
     corrected_lines = [normalize_subtitle_punctuation(line) for line in corrected_lines]
 
-    dialogue = is_two_speaker_dialogue(original_lines)
-    if dialogue:
-        original_lines = format_dialogue_lines(original_lines)
-        if len(corrected_lines) != 2 or not all(
-            line[2:].strip() for line in format_dialogue_lines(corrected_lines)
-        ):
-            notes.append("[되돌림] 대사 구성 불일치로 대사 표기만 교정")
-            corrected_lines = original_lines
+    original_lines = expand_subtitle_lines(original_lines)
+    corrected_lines = expand_subtitle_lines(corrected_lines)
+    segments = subtitle_segments(original_lines)
+    if len(segments) > 1:
+        source_line_count = len(original_lines)
+        original_lines = format_subtitle_segments(segments)
+        if len(corrected_lines) == source_line_count:
+            response_segments = []
+            offset = 0
+            for group in segments:
+                response_segments.append(corrected_lines[offset:offset + len(group)])
+                offset += len(group)
+        elif len(corrected_lines) == len(segments):
+            response_segments = [[line] for line in corrected_lines]
         else:
-            corrected_lines = format_dialogue_lines(corrected_lines)
-
-    if wrap_length is None or dialogue:
-        if len(corrected_lines) != len(original_lines):
-            notes.append("[되돌림] 줄 수 불일치로 원본 유지")
-            return original_lines, notes
-
-        result: list[str] = []
-        for number, (original, revised) in enumerate(
-            zip(original_lines, corrected_lines, strict=True), start=1
-        ):
-            if has_added_punctuation(original, revised):
-                notes.append(
-                    f"[되돌림] {number}번째 줄: 문장부호 추가 감지로 원본 유지"
-                    + punctuation_review_details(
-                        original, revised, [source_lines[number - 1]], [response_lines[number - 1]],
-                    )
-                )
-                result.append(original)
-                continue
-            result.append(revised)
-        if dialogue and wrap_length is not None and violates_wrap_rules(result, wrap_length):
-            notes.append(f"[확인필요] {wrap_length}자 초과: 두 사람의 대사 구분 유지")
+            response_segments = subtitle_segments(corrected_lines)
+        candidate = format_subtitle_segments(response_segments)
+        # 서식은 설명 자막의 단서일 수 있으므로 같은 위치에 유지한다.
+        tags = lambda line: re.findall(r"<[^>]+>|\{\\[^}]+\}", line)
+        valid = len(candidate) == len(original_lines) and all(
+            re.sub(r"^[-/]\s*", "", new.strip(), count=1).strip()
+            and tags(old) == tags(new)
+            and (not tags(old) or bool(re.match(r"^\s*[-/]", old)) == bool(re.match(r"^\s*[-/]", new)))
+            for old, new in zip(original_lines, candidate)
+        )
+        if not valid:
+            notes.append(revert_note("대사·서식 경계 불일치로 원본 구성 유지"))
+            result = original_lines
+        else:
+            # 응답에서 생략된 대사 표식도 원본 구분에 맞춰 복구한다.
+            result = [
+                "- " + re.sub(r"^[-/]\s*", "", new.strip(), count=1)
+                if old.startswith("- ") else new
+                for old, new in zip(original_lines, candidate)
+            ]
+        if wrap_length is not None and any(len(line) > wrap_length for line in result):
+            notes.append(f"[확인필요] {wrap_length}자/{MAX_WRAPPED_LINES}줄 초과: 대사·서식 구분 유지")
         return result, notes
 
-    # 줄 나눔 모드는 줄 수가 달라질 수 있으므로 블록 단위로 검증한다.
     lines = [line.strip() for line in corrected_lines if line.strip()]
     if not lines:
-        notes.append("[되돌림] 빈 교정 결과로 원본 유지")
-        lines = list(original_lines)
-    elif has_added_punctuation("".join(original_lines), "".join(lines)):
-        notes.append(
-            "[되돌림] 문장부호 추가 감지로 원본 유지"
-            + punctuation_review_details("".join(original_lines), "".join(lines), source_lines, response_lines)
-        )
+        notes.append(revert_note("빈 교정 결과로 원본 유지"))
         lines = list(original_lines)
 
-    if violates_wrap_rules(lines, wrap_length):
+    if wrap_length is not None and violates_wrap_rules(lines, wrap_length):
         rewrapped = rewrap_lines(lines, wrap_length)
         if rewrapped is None:
             notes.append(
@@ -343,7 +358,7 @@ def build_messages(
     wrap_length: int | None,
 ) -> list[tuple[str, str]]:
     if wrap_length is None:
-        line_rule = "절대 줄을 합치거나 나누지 말고 입력의 줄 개수를 그대로 유지한다. "
+        line_rule = "아래 대사 표식 정리에 필요한 경우 외에는 입력의 줄을 합치거나 나누지 않는다. "
     else:
         line_rule = (
             f"각 줄은 공백 포함 {wrap_length}자를 넘지 않게 하고 "
@@ -368,20 +383,25 @@ def build_messages(
         "한글로 바꾸거나 삭제하지 않고 괄호와 내용을 그대로 유지한다. "
         "같은 줄에 부연 표기와 독립된 한자가 함께 있으면 부연 표기만 보존하고 나머지는 독음으로 바꾼다. "
         "고유명사도 한국식 한자 독음을 적용하되 문맥상 독음을 확신할 수 없으면 원문을 유지한다. "
+        "입력의 줄바꿈을 유지한다. 두 줄이 짧거나 합쳐도 한 줄에 들어간다는 이유, "
+        "같은 문장이나 같은 사람의 발언이라는 이유만으로 줄을 합치지 않는다. "
+        "줄 구성 변경은 아래 대사 표식 정리와 명시된 긴 줄 나누기 규칙에 필요한 경우에만 허용한다. "
         f"{line_rule}"
-        "두 줄 중 둘째 줄이 / 또는 -로 시작하는 자막은 두 사람의 대사다. "
+        "줄 시작의 / 또는 -는 대사 경계이며, '마시지요 /네'처럼 문장 뒤의 /도 문맥상 대답이면 대사를 나눈다. "
+        "경로, URL, 분수, '커피/차' 같은 선택지의 /는 대사 표식이 아니다. "
+        "대사 표식으로 여러 발언이 구분된 블록을 정리할 때에만, "
+        "한 발언에 속한 여러 줄을 공백으로 연결해 발언당 한 줄로 만들 수 있다. "
+        "표식으로 구분된 발언은 각각 별도 줄로 유지한다. "
         "각 대사 앞의 / 또는 - 표기를 '- ' (하이픈과 공백 한 칸)으로 통일하고, "
-        "첫째 줄에도 '- '를 붙인다. "
-        "두 사람의 대사는 줄 길이 제한보다 화자 구분을 우선하여 반드시 두 줄로 유지하고 "
-        "서로 합치거나 다른 화자의 줄로 옮기지 않는다. "
-        "대사 구분 표식이 없는 일반 두 줄 자막을 임의로 두 사람의 대사로 바꾸지 않는다. "
+        "첫 대사에도 '- '를 붙인다. 서식 태그가 있는 설명 자막에는 대사 표식을 임의로 붙이지 않는다. "
+        "대사와 서식 줄의 구분은 길이·최대 줄 수 제한보다 우선하며 세 발언을 두 줄로 줄이지 않는다. "
+        "다른 발언끼리 합치거나 내용을 옮기지 않고, 서식 태그와 설명 자막·대사 사이의 경계를 유지한다. "
+        "대사 구분 표식이 없는 자막을 임의로 두 사람의 대사로 바꾸지 않는다. "
         "기존 말줄임표는 점 두 개(..), 연속된 점, 특수문자 표기 모두 점 세 개(...)로 통일한다. "
         "한국어 자막의 문장 끝 마침표(.)는 생략한다. 원문에 있어도 제거하며 "
         "따옴표나 닫는 서식 태그 앞의 문장 끝 마침표도 제거한다. "
         "말줄임표(...)와 소수점, URL 및 약어 내부의 점은 마침표와 혼동하지 말고 유지한다. "
-        "문맥과 문장 구조에 필요한 쉼표(,)는 추가할 수 있다. 불필요하게 추가하거나 반복하지 않는다. "
-        "쉼표, 대사 구분용 하이픈과 기존 말줄임표의 표기 통일 이외의 문장부호는 추가하지 않는다. "
-        "특히 원문에 없는 물음표, 느낌표, 따옴표, 마침표나 말줄임표를 추가하지 마라. "
+        "문맥과 문장 구조에 필요한 문장부호는 추가하거나 수정할 수 있다. 불필요하게 추가하거나 반복하지 않는다. "
         "확신할 수 없는 줄은 원문을 그대로 반환한다. "
         "주어진 id를 빠짐없이 정확히 한 번씩 포함해야 한다."
     )
@@ -412,6 +432,35 @@ def request_corrections(
     return CorrectionBatch.model_validate(parsed).items
 
 
+def rate_limit_delay(error: openai.RateLimitError, attempt: int) -> float:
+    """서버의 재시도 시각을 우선하고 없으면 지수 대기와 무작위 지연을 적용한다."""
+    headers = error.response.headers
+    for name, divisor in (("retry-after-ms", 1000), ("retry-after", 1)):
+        value = headers.get(name)
+        if value is None:
+            continue
+        try:
+            seconds = float(value) / divisor
+        except ValueError:
+            try:
+                seconds = (parsedate_to_datetime(value) - datetime.now(timezone.utc)).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                continue
+        if math.isfinite(seconds) and seconds >= 0:
+            return seconds
+    return min(2 ** attempt, 60) + random.uniform(0, 1)
+
+
+def wait_for_retry(seconds: float, is_cancelled: Callable[[], bool] | None) -> None:
+    deadline = monotonic() + seconds
+    while True:
+        check_cancelled(is_cancelled)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return
+        sleep(min(remaining, 0.1))
+
+
 def correct_batch_with_retry(
     corrector: Any,
     payload: list[dict[str, object]],
@@ -434,6 +483,14 @@ def correct_batch_with_retry(
                 on_log(message)
             else:
                 print(message, file=sys.stderr)
+            if isinstance(error, openai.RateLimitError) and attempt < attempt_limit:
+                delay = rate_limit_delay(error, attempt)
+                message = f"[요청 제한] {delay:.1f}초 대기 후 재시도"
+                if on_log:
+                    on_log(message)
+                else:
+                    print(message, file=sys.stderr)
+                wait_for_retry(delay, is_cancelled)
     return None
 
 
@@ -479,9 +536,7 @@ def revise_subtitles(
         payload: list[dict[str, object]] = [
             {
                 "id": i,
-                "lines": format_dialogue_lines(blocks[i].text_lines)
-                if is_two_speaker_dialogue(blocks[i].text_lines)
-                else blocks[i].text_lines,
+                "lines": prepare_subtitle_lines(blocks[i].text_lines),
             }
             for i in requested_ids
         ]
@@ -512,10 +567,16 @@ def revise_subtitles(
     for i, block in enumerate(blocks):
         corrected_lines = corrections.get(i)
         if corrected_lines is None:
-            revised.append(block)
-            continue
+            final_lines, notes = block.text_lines, []
+        else:
+            final_lines, notes = sanitize_lines(block.text_lines, corrected_lines, wrap_length)
 
-        final_lines, notes = sanitize_lines(block.text_lines, corrected_lines, wrap_length)
+        # 누락·실패로 원본을 유지한 경우에도 최종 자막의 줄 수를 검사한다.
+        if block.is_subtitle and len(final_lines) > MAX_WRAPPED_LINES:
+            notes.append(
+                f"[확인필요] 최종 자막 {len(final_lines)}줄: 최대 {MAX_WRAPPED_LINES}줄 초과, "
+                "타임스탬프 분리 등 수동 편집 필요"
+            )
         for note in notes:
             tag, _, message = note.partition(" ")
             logs.append(f"{tag} 자막 {label(i)}: {message}")
