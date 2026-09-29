@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from time import monotonic
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -540,26 +541,44 @@ def check_cancelled(is_cancelled: Callable[[], bool] | None) -> None:
 def collect_srt_files(
     paths: Iterable[Path],
     is_cancelled: Callable[[], bool] | None = None,
+    on_progress: Callable[[int, str], None] | None = None,
 ) -> list[Path]:
     found: set[Path] = set()
+    last_report: float | None = None
+    current_location = ""
+
+    def report_progress(*, force: bool = False) -> None:
+        nonlocal last_report
+        now = monotonic()
+        if on_progress is not None and (force or last_report is None or now - last_report >= 0.1):
+            on_progress(len(found), current_location)
+            last_report = now
 
     def raise_walk_error(error: OSError) -> None:
         raise error
 
     for path in paths:
         check_cancelled(is_cancelled)
+        current_location = str(path)
+        report_progress()
         path = path.resolve()
         if path.is_dir():
             for directory, _, names in os.walk(path, onerror=raise_walk_error):
                 check_cancelled(is_cancelled)
+                current_location = str(directory)
+                report_progress()
                 for name in names:
+                    check_cancelled(is_cancelled)
                     candidate = Path(directory) / name
                     if candidate.suffix.lower() == ".srt" and candidate.is_file():
                         found.add(candidate.resolve())
+                    report_progress()
         elif path.is_file() and path.suffix.lower() == ".srt":
             found.add(path)
         elif not path.exists():
             raise FileNotFoundError(f"입력 경로를 찾을 수 없습니다: {path}")
+    check_cancelled(is_cancelled)
+    report_progress(force=True)
     return sorted(found, key=lambda path: str(path).casefold())
 
 

@@ -116,20 +116,25 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
     finish_work(window, app)
     assert created == [1]
     table = window.evaluation_table
-    assert [table.item(row, 0).text() for row in range(4)] == ["ten.srt", "two.srt", "zero.srt", "failed.srt"]
+    assert [table.item(row, 0).text() for row in range(4)] == [
+        str(Path(tmp_path.name) / name) for name in ("ten.srt", "two.srt", "zero.srt", "failed.srt")
+    ]
+    assert table.item(0, 0).toolTip() == str(paths[2])
     assert [table.item(row, 2).text() for row in range(4)] == ["10", "2", "0", "—"]
     assert [table.item(row, 3).text() for row in range(4)] == ["10000", "100", "500", "—"]
     assert [table.item(row, 4).text() for row in range(4)] == ["1.00", "20.00", "0.00", "—"]
     assert table.isSortingEnabled()
     assert window.export_button.isEnabled()
     table.sortItems(4, Qt.SortOrder.DescendingOrder)
-    assert [table.item(row, 0).text() for row in range(4)] == ["two.srt", "ten.srt", "zero.srt", "failed.srt"]
+    assert [table.item(row, 0).text() for row in range(4)] == [
+        str(Path(tmp_path.name) / name) for name in ("two.srt", "ten.srt", "zero.srt", "failed.srt")
+    ]
     assert "오류 12건" in window.status_label.text()
     assert [window.table.item(row, 1).text() for row in range(4)] == correction_states
     assert window.paths == paths
     window.start_correction()
     finish_work(window, app)
-    assert table.item(0, 0).text() == "ten.srt"
+    assert table.item(0, 0).text() == str(Path(tmp_path.name) / "ten.srt")
     window.mode_combo.setCurrentIndex(0)
     assert window.evaluation_table.isHidden()
     assert window.export_button.isHidden()
@@ -154,13 +159,13 @@ def test_evaluation_sorts_only_when_finished(window, app, tmp_path, monkeypatch)
     window.start_correction()
     try:
         wait_until(entered.is_set)
-        assert window.evaluation_table.item(0, 0).text() == "first.srt"
+        assert window.evaluation_table.item(0, 0).text() == str(Path(tmp_path.name) / "first.srt")
         assert not window.files_button.isEnabled()
         assert not window.evaluation_table.isSortingEnabled()
     finally:
         release.set()
         finish_work(window, app)
-    assert window.evaluation_table.item(0, 0).text() == "second.srt"
+    assert window.evaluation_table.item(0, 0).text() == str(Path(tmp_path.name) / "second.srt")
 
 
 def test_evaluation_frequency_rounding_and_empty_text(window):
@@ -180,7 +185,7 @@ def prepare_csv_table(window):
     table = window.evaluation_table
     table.setRowCount(4)
     for row, (name, state, result) in enumerate([
-        ('한글,"자막".srt', "완료", gui.EvaluationResult(10, 10000)),
+        ('기린의 날개 (2012)\\한글,"자막".srt', "완료", gui.EvaluationResult(10, 10000)),
         ("빈도 높은 자막.srt", "완료", gui.EvaluationResult(2, 100)),
         ("실패.srt", "실패", None),
         ("중단.srt", "중단", None),
@@ -202,7 +207,7 @@ def test_export_csv_preserves_table_order_headers_and_values(window, tmp_path, m
     assert rows == [
         ["평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수"],
         ["빈도 높은 자막.srt", "완료", "2", "100", "20.00"],
-        ['한글,"자막".srt', "완료", "10", "10000", "1.00"],
+        ['기린의 날개 (2012)\\한글,"자막".srt', "완료", "10", "10000", "1.00"],
         ["실패.srt", "실패", "—", "—", "—"],
         ["중단.srt", "중단", "—", "—", "—"],
     ]
@@ -268,8 +273,8 @@ def test_version_matches_package_and_titles(window) -> None:
     project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == gui.__version__ == "1.1.4"
-    expected_title = "SRT Spellchecker v1.1.4"
+    assert project["project"]["version"] == gui.__version__ == "1.1.5"
+    expected_title = "SRT Spellchecker v1.1.5"
     assert window.windowTitle() == expected_title
     assert any(label.text() == expected_title for label in window.findChildren(QLabel))
 
@@ -779,10 +784,10 @@ def test_queue_waits_for_slow_file_discovery(window, app, tmp_path, monkeypatch)
             assert release.wait(5)
         return path.with_stem(path.stem + "_revised"), []
 
-    def slow_collect(sources, is_cancelled):
+    def slow_collect(sources, is_cancelled, on_progress):
         scanning.set()
         assert release_scan.wait(5)
-        return collect(sources, is_cancelled)
+        return collect(sources, is_cancelled, on_progress)
 
     monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
     monkeypatch.setattr(gui, "correct_file", correct_file)
@@ -794,6 +799,8 @@ def test_queue_waits_for_slow_file_discovery(window, app, tmp_path, monkeypatch)
         assert started.wait(5)
         window.add_paths(paths[1:2])
         assert scanning.wait(5)
+        assert not window.loading_panel.isHidden()
+        assert window.progress_bar.maximum() == 1000
         release.set()
         wait_until(lambda: window.worker is None)
         assert window.file_loader is not None
@@ -806,9 +813,53 @@ def test_queue_waits_for_slow_file_discovery(window, app, tmp_path, monkeypatch)
         release_scan.set()
     finish_work(window, app)
     assert processed == paths
+    assert window.loading_panel.isHidden()
     assert window.paths == paths
     assert "저장 3개" in window.status_label.text()
     assert not window.start_button.isEnabled()
+
+
+@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+def test_file_loading_indicator_lifecycle(window, app, tmp_path, monkeypatch, mode, outcome):
+    entered, release = Event(), Event()
+    path = tmp_path / "found.srt"
+    window.mode_combo.setCurrentIndex(mode)
+    window.progress_bar.setValue(450)
+
+    def collect(sources, is_cancelled, on_progress):
+        on_progress(1234, str(tmp_path))
+        entered.set()
+        assert release.wait(5)
+        if outcome == "error":
+            raise OSError("폴더 접근 실패")
+        gui.check_cancelled(is_cancelled)
+        return [path]
+
+    monkeypatch.setattr(gui, "collect_srt_files", collect)
+    window.add_paths([tmp_path])
+    try:
+        wait_until(lambda: entered.is_set() and "1,234" in window.loading_label.text())
+        assert not window.loading_panel.isHidden()
+        assert window.loading_progress.minimum() == window.loading_progress.maximum() == 0
+        assert window.loading_label.toolTip() == str(tmp_path)
+        assert window.progress_bar.value() == 450
+        assert window.cancel_button.isEnabled()
+        assert not window.start_button.isEnabled()
+        if outcome == "cancel":
+            window.cancel_work()
+            assert "파일 탐색 중단 대기" in window.loading_label.text()
+            assert "API" not in window.status_label.text()
+    finally:
+        release.set()
+        finish_work(window, app)
+    assert window.loading_panel.isHidden()
+    assert not window.cancel_button.isEnabled()
+    assert window.paths == ([path] if outcome == "success" else [])
+    if outcome == "error":
+        assert "폴더 접근 실패" in window.status_label.text()
+    elif outcome == "cancel":
+        assert "파일 불러오기 중단됨" in window.status_label.text()
 
 
 def test_file_error_does_not_stop_next_file(window, app, tmp_path, monkeypatch) -> None:

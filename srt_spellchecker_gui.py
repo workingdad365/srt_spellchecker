@@ -28,7 +28,7 @@ from srt_spellchecker import (
 )
 
 
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 
 
 class FileTable(QTableWidget):
@@ -113,6 +113,22 @@ class BackgroundTask(QThread):
             pass
         except Exception as error:
             self.failed.emit(str(error))
+
+
+class FileDiscoveryTask(BackgroundTask):
+    progress = Signal(int, str)
+
+    def __init__(self, paths: list[Path], parent: QWidget) -> None:
+        super().__init__(
+            lambda: collect_srt_files(paths, self.isInterruptionRequested, self.progress.emit), parent,
+        )
+        self.cancelled = False
+
+    def run(self) -> None:
+        try:
+            super().run()
+        finally:
+            self.cancelled = self.isInterruptionRequested()
 
 
 class CorrectionWorker(QThread):
@@ -272,7 +288,7 @@ class MainWindow(QMainWindow):
         self.completed_paths: set[Path] = set()
         self.review_results: dict[Path, tuple[str, list[str]]] = {}
         self.worker: QThread | None = None
-        self.file_loader: BackgroundTask | None = None
+        self.file_loader: FileDiscoveryTask | None = None
         self._file_requests: list[list[Path]] = []
         self._correction_active = False
         self._session_paths: list[Path] = []
@@ -394,6 +410,20 @@ class MainWindow(QMainWindow):
         self.count_label = QLabel("자막 0개")
         tools.addWidget(self.count_label)
         root.addLayout(tools)
+
+        self.loading_panel = QWidget()
+        loading_layout = QHBoxLayout(self.loading_panel)
+        loading_layout.setContentsMargins(0, 0, 0, 0)
+        self.loading_label = QLabel("파일 불러오는 중 · SRT 0개 발견")
+        loading_layout.addWidget(self.loading_label, 1)
+        self.loading_progress = QProgressBar()
+        self.loading_progress.setRange(0, 0)
+        self.loading_progress.setTextVisible(False)
+        self.loading_progress.setFixedWidth(180)
+        self.loading_progress.setAccessibleName("자막 파일 탐색 진행 중")
+        loading_layout.addWidget(self.loading_progress)
+        self.loading_panel.hide()
+        root.addWidget(self.loading_panel)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.table = FileTable()
@@ -700,23 +730,36 @@ class MainWindow(QMainWindow):
         if self.file_loader is not None or not self._file_requests:
             return
         paths = self._file_requests.pop(0)
-        worker = BackgroundTask(lambda: collect_srt_files(paths, worker.isInterruptionRequested), self)
+        worker = FileDiscoveryTask(paths, self)
+        worker.progress.connect(self._file_discovery_progress)
         worker.result.connect(self._files_loaded)
         worker.failed.connect(self.show_error)
         worker.finished.connect(self._file_loader_finished)
         self.file_loader = worker
+        self.loading_label.setText("파일 불러오는 중 · SRT 0개 발견")
+        self.loading_label.setToolTip(str(paths[0]))
+        self.loading_panel.show()
         if not self._correction_active:
             self.status_label.setText("자막 파일 탐색 중")
         self._update_controls()
         worker.start()
+
+    def _file_discovery_progress(self, count: int, location: str) -> None:
+        stopping = self.file_loader is not None and self.file_loader.isInterruptionRequested()
+        state = "파일 탐색 중단 대기" if stopping else "파일 불러오는 중"
+        self.loading_label.setText(f"{state} · SRT {count:,}개 발견")
+        self.loading_label.setToolTip(location)
 
     def _file_loader_finished(self) -> None:
         worker = self.file_loader
         self.file_loader = None
         if worker is not None:
             worker.wait()
+            if worker.cancelled and self.worker is None:
+                self.status_label.setText("파일 불러오기 중단됨")
             worker.deleteLater()
         self._load_next_files()
+        self.loading_panel.setVisible(self.file_loader is not None)
         self._advance_correction()
         self._update_controls()
         if self.close_pending and self.worker is None and self.file_loader is None:
@@ -857,7 +900,7 @@ class MainWindow(QMainWindow):
         self.evaluation_table.setRowCount(0)
         for row, path in enumerate(self.paths):
             self.evaluation_table.insertRow(row)
-            item = QTableWidgetItem(path.name)
+            item = QTableWidgetItem(str(Path(path.parent.name) / path.name))
             item.setToolTip(str(path))
             self.evaluation_table.setItem(row, 0, item)
             self._evaluation_result(row, "대기", None)
@@ -975,9 +1018,12 @@ class MainWindow(QMainWindow):
         for worker in (self.worker, self.file_loader):
             if worker is not None:
                 worker.requestInterruption()
+        if self.file_loader is not None:
+            self.loading_label.setText(self.loading_label.text().replace("파일 불러오는 중", "파일 탐색 중단 대기"))
         if self.worker is not None or self.file_loader is not None:
             self.status_label.setText(
                 "중단 요청됨: 진행 중인 분석 종료 대기" if isinstance(self.worker, EvaluationWorker)
+                else "중단 요청됨: 파일 탐색 종료 대기" if self.worker is None
                 else "중단 요청됨: 진행 중인 API 요청 종료 대기"
             )
             self._update_controls()

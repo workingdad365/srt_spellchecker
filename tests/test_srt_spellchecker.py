@@ -567,6 +567,32 @@ def test_collect_srt_recursively_and_deduplicate(tmp_path: Path) -> None:
     assert set(sc.collect_srt_files([tmp_path, nested, first])) == {first, second, revised}
 
 
+def test_collect_progress_is_throttled_and_counts_unique_files(tmp_path, monkeypatch):
+    files = [tmp_path / f"{index}.srt" for index in range(20)]
+    for path in files:
+        path.touch()
+    progress = []
+    monkeypatch.setattr(sc, "monotonic", lambda: 100.0)
+    result = sc.collect_srt_files([tmp_path, files[0]], on_progress=lambda *args: progress.append(args))
+    assert set(result) == set(files)
+    assert [count for count, _ in progress] == [0, 20]
+    assert progress[0][1] == str(tmp_path)
+
+
+def test_collect_can_cancel_within_large_directory(tmp_path, monkeypatch):
+    for index in range(20):
+        (tmp_path / f"{index}.srt").touch()
+    ticks = iter(range(100))
+    monkeypatch.setattr(sc, "monotonic", lambda: float(next(ticks)))
+    counts = []
+    with pytest.raises(sc.CorrectionCancelled):
+        sc.collect_srt_files(
+            [tmp_path], is_cancelled=lambda: bool(counts and counts[-1] == 1),
+            on_progress=lambda count, _location: counts.append(count),
+        )
+    assert counts[-1] == 1
+
+
 def test_correct_file_keeps_existing_outputs_and_encoding(tmp_path: Path) -> None:
     source = tmp_path / "in.srt"
     source.write_bytes(codecs.BOM_UTF8 + SAMPLE.replace("\n", "\r\n").encode("utf-8"))
