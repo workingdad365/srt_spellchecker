@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 from PySide6.QtCore import QIODevice, QMimeData, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
     QSizePolicy, QSpinBox, QSplitter, QStyle, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget,
 )
@@ -350,10 +350,17 @@ class MainWindow(QMainWindow):
         heading.setFont(font)
         root.addWidget(heading)
 
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["LLM 교정", "간이평가"])
-        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
-        root.addWidget(self.mode_combo)
+        mode_layout = QHBoxLayout()
+        self.mode_group = QButtonGroup(self)
+        self.correction_radio = QRadioButton("LLM 교정")
+        self.evaluation_radio = QRadioButton("간이평가")
+        for button in (self.correction_radio, self.evaluation_radio):
+            self.mode_group.addButton(button)
+            mode_layout.addWidget(button)
+        self.correction_radio.setChecked(True)
+        self.evaluation_radio.toggled.connect(self._mode_changed)
+        mode_layout.addStretch()
+        root.addLayout(mode_layout)
 
         self.settings_panel = QWidget()
         form = QFormLayout(self.settings_panel)
@@ -497,7 +504,7 @@ class MainWindow(QMainWindow):
         return self.model_combo.itemData(index) if index >= 0 else None
 
     def _mode_changed(self) -> None:
-        evaluation = self.mode_combo.currentIndex() == 1
+        evaluation = self.evaluation_radio.isChecked()
         self.settings_panel.setVisible(not evaluation)
         self.wrap_check.setVisible(not evaluation)
         self.length_spin.setVisible(not evaluation)
@@ -514,7 +521,8 @@ class MainWindow(QMainWindow):
         busy = self.worker is not None or self.file_loader is not None or self._correction_active
         can_add = not self.close_pending and (self.worker is None or isinstance(self.worker, CorrectionWorker))
         self.settings_panel.setEnabled(not busy)
-        self.mode_combo.setEnabled(not busy)
+        self.correction_radio.setEnabled(not busy)
+        self.evaluation_radio.setEnabled(not busy)
         self.fetch_button.setEnabled(not busy and bool(self.key_edit.text().strip()))
         self.model_combo.setEnabled(not busy and self.model_combo.count() > 0)
         for widget in (self.files_button, self.folder_button, self.table):
@@ -524,11 +532,11 @@ class MainWindow(QMainWindow):
         self.remove_button.setEnabled(not busy and bool(self.table.selectedItems()))
         self.clear_button.setEnabled(not busy and bool(self.paths))
         self.export_button.setEnabled(
-            not busy and self.mode_combo.currentIndex() == 1 and self.evaluation_table.rowCount() > 0
+            not busy and self.evaluation_radio.isChecked() and self.evaluation_table.rowCount() > 0
         )
         self.start_button.setEnabled(
             not busy and (
-                bool(self.paths) if self.mode_combo.currentIndex() == 1 else
+                bool(self.paths) if self.evaluation_radio.isChecked() else
                 any(path not in self.completed_paths for path in self.paths)
                 and bool(self.key_edit.text().strip()) and self.selected_model() is not None
             )
@@ -770,7 +778,7 @@ class MainWindow(QMainWindow):
         added = 0
         for path in paths:
             path = path.resolve()
-            if path in known or (path in self.completed_paths and self.mode_combo.currentIndex() == 0):
+            if path in known or (path in self.completed_paths and self.correction_radio.isChecked()):
                 continue
             known.add(path)
             self.paths.append(path)
@@ -870,7 +878,7 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
 
     def start_correction(self) -> None:
-        if self.mode_combo.currentIndex() == 1:
+        if self.evaluation_radio.isChecked():
             self.start_evaluation()
             return
         model = self.selected_model()

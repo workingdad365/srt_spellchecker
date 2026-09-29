@@ -87,12 +87,30 @@ def prepare_model(window) -> None:
     window.model_combo.setCurrentIndex(0)
 
 
+def test_mode_radio_buttons_are_exclusive_and_switch_panels(window):
+    assert window.correction_radio.isChecked()
+    assert not window.evaluation_radio.isChecked()
+    window.evaluation_radio.click()
+    assert window.evaluation_radio.isChecked()
+    assert not window.correction_radio.isChecked()
+    assert window.settings_panel.isHidden()
+    assert window.start_button.text() == "평가 시작"
+    window.evaluation_radio.click()
+    assert window.evaluation_radio.isChecked()
+    window.correction_radio.click()
+    assert window.correction_radio.isChecked()
+    assert not window.evaluation_radio.isChecked()
+    assert not window.settings_panel.isHidden()
+    assert window.evaluation_table.isHidden()
+    assert window.start_button.text() == "교정 시작"
+
+
 def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, monkeypatch):
     paths = [tmp_path / name for name in ("two.srt", "failed.srt", "ten.srt", "zero.srt")]
     window._files_loaded(paths)
     window._file_state(0, "완료", str(tmp_path / "two_revised.srt"))
     correction_states = [window.table.item(row, 1).text() for row in range(4)]
-    window.mode_combo.setCurrentIndex(1)
+    window.evaluation_radio.click()
     assert window.start_button.isEnabled()
     assert window.settings_panel.isHidden()
     assert window.wrap_check.isHidden()
@@ -111,7 +129,8 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
 
     monkeypatch.setattr(gui, "evaluate_file", evaluate)
     window.start_correction()
-    assert not window.mode_combo.isEnabled()
+    assert not window.correction_radio.isEnabled()
+    assert not window.evaluation_radio.isEnabled()
     assert not window.export_button.isEnabled()
     finish_work(window, app)
     assert created == [1]
@@ -135,7 +154,7 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
     window.start_correction()
     finish_work(window, app)
     assert table.item(0, 0).text() == str(Path(tmp_path.name) / "ten.srt")
-    window.mode_combo.setCurrentIndex(0)
+    window.correction_radio.click()
     assert window.evaluation_table.isHidden()
     assert window.export_button.isHidden()
     assert not window.settings_panel.isHidden()
@@ -145,7 +164,7 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
 def test_evaluation_sorts_only_when_finished(window, app, tmp_path, monkeypatch):
     paths = [tmp_path / "first.srt", tmp_path / "second.srt"]
     window._files_loaded(paths)
-    window.mode_combo.setCurrentIndex(1)
+    window.evaluation_radio.click()
     entered, release = Event(), Event()
     monkeypatch.setattr(gui, "create_spacer", object)
 
@@ -181,7 +200,7 @@ def test_evaluation_frequency_rounding_and_empty_text(window):
 
 
 def prepare_csv_table(window):
-    window.mode_combo.setCurrentIndex(1)
+    window.evaluation_radio.click()
     table = window.evaluation_table
     table.setRowCount(4)
     for row, (name, state, result) in enumerate([
@@ -824,7 +843,7 @@ def test_queue_waits_for_slow_file_discovery(window, app, tmp_path, monkeypatch)
 def test_file_loading_indicator_lifecycle(window, app, tmp_path, monkeypatch, mode, outcome):
     entered, release = Event(), Event()
     path = tmp_path / "found.srt"
-    window.mode_combo.setCurrentIndex(mode)
+    (window.evaluation_radio if mode else window.correction_radio).click()
     window.progress_bar.setValue(450)
 
     def collect(sources, is_cancelled, on_progress):
