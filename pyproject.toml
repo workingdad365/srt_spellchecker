@@ -14,7 +14,6 @@ dependencies = [
 
 [project.gui-scripts]
 srt-spellchecker = "srt_spellchecker_gui:main"
-srt-spellchecker-gui = "srt_spellchecker_gui:main"
 
 [dependency-groups]
 dev = [

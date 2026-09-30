@@ -123,7 +123,7 @@ uv tool install --editable --force .
 srt-spellchecker
 ```
 
-`srt-spellchecker`와 `srt-spellchecker-gui`는 모두 GUI를 실행하며 Windows에서 별도 콘솔 창을 만들지 않는다. 파일 인자와 명령행 교정 옵션은 제공하지 않는다. 파일 추가와 모든 설정은 GUI에서 수행한다.
+`srt-spellchecker`로 GUI를 실행하며 Windows에서 별도 콘솔 창을 만들지 않는다. 파일 인자와 명령행 교정 옵션은 제공하지 않는다. 파일 추가와 모든 설정은 GUI에서 수행한다.
 
 1. **AI 서비스**에서 OpenAI 또는 OpenRouter를 선택한다.
 2. **API 키**를 입력하고 **모델 가져오기**를 누른다.
