@@ -449,7 +449,7 @@ class MainWindow(QMainWindow):
         self.table = FileTable()
         self.table.paths_dropped.connect(self.add_paths)
         self.table.itemSelectionChanged.connect(self._update_controls)
-        self.table.cellDoubleClicked.connect(self.open_file_location)
+        self.table.cellDoubleClicked.connect(self.open_subtitle_target)
         splitter.addWidget(self.table)
         self.evaluation_table = QTableWidget(0, 5)
         self.evaluation_table.setHorizontalHeaderLabels([
@@ -879,11 +879,15 @@ class MainWindow(QMainWindow):
             self._update_controls()
             self._save_worklist()
 
-    def open_file_location(self, row: int, column: int) -> None:
-        item = self.table.item(row, column)
+    def open_subtitle_target(self, row: int, column: int) -> None:
+        if column not in (0, 1, 2):
+            return
+        item = self.table.item(row, 0 if column == 1 else column)
         path = item.toolTip() if item is not None else ""
         if path:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
+            if column == 1:
+                path = str(Path(path).parent)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def start_correction(self) -> None:
         if self.evaluation_radio.isChecked():
