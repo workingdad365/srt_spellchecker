@@ -293,8 +293,8 @@ def test_version_matches_package_and_titles(window) -> None:
     project_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
     with project_path.open("rb") as project_file:
         project = tomllib.load(project_file)
-    assert project["project"]["version"] == gui.__version__ == "1.1.5"
-    expected_title = "SRT Spellchecker v1.1.5"
+    assert project["project"]["version"] == gui.__version__ == "1.1.6"
+    expected_title = "SRT Spellchecker v1.1.6"
     assert window.windowTitle() == expected_title
     assert any(label.text() == expected_title for label in window.findChildren(QLabel))
 
@@ -1273,15 +1273,39 @@ def test_key_debounce_saves_without_focus_change(window, app) -> None:
     assert window.settings.load_key("OpenAI") == "auto-saved-secret"
 
 
-def test_saved_key_takes_priority_over_environment(window, app, monkeypatch) -> None:
-    window.settings.save_key("OpenAI", "vault-secret")
+@pytest.mark.parametrize("saved_key", ["vault-secret", ""])
+def test_gui_uses_only_saved_keys_and_ignores_environment(window, app, tmp_path, monkeypatch, saved_key) -> None:
+    window.settings.save_key("OpenAI", saved_key)
     monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
     monkeypatch.setenv("OPENROUTER_API_KEY", "router-environment-secret")
+    monkeypatch.setenv("OPENAI_MODEL", "environment-model")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=dotenv-secret\n", encoding="utf-8")
     restored = gui.MainWindow()
     try:
-        assert restored.key_edit.text() == "vault-secret"
+        assert restored.key_edit.text() == saved_key
+        assert restored.selected_model() is None
         restored.service_combo.setCurrentText("OpenRouter")
-        assert restored.key_edit.text() == "router-environment-secret"
+        assert restored.key_edit.text() == ""
+        assert not restored.fetch_button.isEnabled()
+        assert not restored.start_button.isEnabled()
+    finally:
+        restored.close()
+        restored.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_cleared_gui_key_stays_empty_after_restart(window, app, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
+    window.key_edit.setText("gui-secret")
+    window.key_edit.editingFinished.emit()
+    assert window.settings.load_key("OpenAI") == "gui-secret"
+    window.key_edit.clear()
+    window.key_edit.editingFinished.emit()
+    restored = gui.MainWindow()
+    try:
+        assert restored.key_edit.text() == ""
+        assert restored.settings.load_key("OpenAI") is None
     finally:
         restored.close()
         restored.deleteLater()

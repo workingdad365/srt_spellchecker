@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import codecs
 from collections.abc import Callable, Iterable
 import json
@@ -15,13 +14,9 @@ from time import monotonic, sleep
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 import openai
 from pydantic import BaseModel, Field
 
-DEFAULT_MODEL = "gpt-5.6-luna"
-DEFAULT_REASONING_EFFORT = "low"
 BATCH_SIZE = 25
 MAX_BATCH_SIZE = 200
 ATTEMPT_LIMIT = 3
@@ -58,47 +53,6 @@ class CorrectionBatch(BaseModel):
     """한 번의 모델 호출에서 반환되는 교정 결과 묶음."""
 
     items: list[CorrectionItem]
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="SRT 자막 파일의 오타/띄어쓰기를 교정한다."
-    )
-    parser.add_argument("srt_file", type=Path, help="입력 SRT 파일 경로")
-    parser.add_argument(
-        "--wrap",
-        action="store_true",
-        help="긴 줄을 최대 2줄로 나눈다 (기본: 원본 줄 구성 유지)",
-    )
-    parser.add_argument(
-        "--max-line-length",
-        type=int,
-        default=DEFAULT_MAX_LINE_LENGTH,
-        help=f"--wrap 사용 시 한 줄 최대 글자 수 (기본: {DEFAULT_MAX_LINE_LENGTH})",
-    )
-    parser.add_argument(
-        "--model",
-        default=None,
-        help=f"사용할 OpenAI 모델 (기본: OPENAI_MODEL 환경 변수 또는 {DEFAULT_MODEL})",
-    )
-    args = parser.parse_args(argv)
-    if args.max_line_length < 1:
-        parser.error("--max-line-length는 1 이상이어야 합니다.")
-    return args
-
-
-def load_environment(model_override: str | None = None) -> tuple[str, str, str]:
-    load_dotenv()
-
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError(
-            "환경 변수가 비어 있습니다: OPENAI_API_KEY. .env.example를 복사한 .env를 채워주세요."
-        )
-
-    model = (model_override or os.getenv("OPENAI_MODEL", "")).strip() or DEFAULT_MODEL
-    effort = os.getenv("OPENAI_REASONING_EFFORT", "").strip() or DEFAULT_REASONING_EFFORT
-    return api_key, model, effort
 
 
 def decode_srt(raw: bytes) -> tuple[str, str]:
@@ -328,30 +282,6 @@ def sanitize_lines(
             lines = rewrapped
 
     return lines, notes
-
-
-def build_llm(api_key: str, model: str, effort: str) -> ChatOpenAI:
-    # GPT-5.x 계열 주의점
-    # - temperature, top_p 등 샘플링 파라미터 미지원 (400 오류) -> 전달하지 않음
-    # - max_tokens 미지원, 추론 토큰도 출력 한도에 포함됨 -> 출력 한도를 지정하지 않음
-    # - 추론 강도는 reasoning.effort로 제어, Responses API 사용
-    return ChatOpenAI(
-        model=model,
-        api_key=api_key,
-        use_responses_api=True,
-        reasoning={"effort": effort},
-        timeout=180,
-        max_retries=3,
-    )
-
-
-def build_corrector(api_key: str, model: str, effort: str) -> Any:
-    return build_llm(api_key, model, effort).with_structured_output(
-        CorrectionBatch,
-        method="json_schema",
-        strict=True,
-        include_raw=True,
-    )
 
 
 def build_messages(
@@ -675,50 +605,3 @@ def correct_file(
             number += 1
             output = input_path.with_name(f"{input_path.stem}_revised_{number}{input_path.suffix}")
     return output, logs
-
-
-def run(argv: list[str] | None = None) -> Path:
-    args = parse_args(argv)
-    input_path: Path = args.srt_file
-
-    if not input_path.exists() or not input_path.is_file():
-        raise FileNotFoundError(f"입력 파일을 찾을 수 없습니다: {input_path}")
-
-    content, encoding = decode_srt(input_path.read_bytes())
-    newline = detect_newline(content)
-
-    api_key, model, effort = load_environment(args.model)
-    corrector = build_corrector(api_key, model, effort)
-    print(f"모델: {model} (추론 강도: {effort})")
-
-    blocks = parse_srt_blocks(content)
-    wrap_length = args.max_line_length if args.wrap else None
-    revised_blocks, logs = revise_subtitles(blocks, corrector, wrap_length)
-
-    # 텍스트 모드의 줄바꿈 자동 변환을 피하기 위해 바이트로 저장한다.
-    output_path = output_path_for(input_path)
-    output_path.write_bytes(render_srt(revised_blocks, newline).encode(encoding))
-
-    for log in logs:
-        print(log, file=sys.stderr)
-    if logs:
-        print(f"검토 로그 {len(logs)}건: 위 항목을 결과 파일에서 확인하세요.", file=sys.stderr)
-    print(f"완료: {output_path}")
-    return output_path
-
-
-def main() -> None:
-    if len(sys.argv) == 1:
-        from srt_spellchecker_gui import main as gui_main
-
-        gui_main()
-        return
-    try:
-        run()
-    except (FileNotFoundError, ValueError, UnicodeDecodeError, openai.APIError) as error:
-        print(f"[오류] {error}", file=sys.stderr)
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

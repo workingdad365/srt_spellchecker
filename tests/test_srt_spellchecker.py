@@ -736,50 +736,6 @@ def test_rate_limit_wait_is_cancellable(monkeypatch):
     assert slept == [0.1]
 
 
-# --- 설정/CLI ---
-
-
-def test_load_environment_defaults_and_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sc, "load_dotenv", lambda: None)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.delenv("OPENAI_MODEL", raising=False)
-    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
-    assert sc.load_environment() == ("sk-test", "gpt-5.6-luna", "low")
-
-    monkeypatch.setenv("OPENAI_MODEL", "env-model")
-    monkeypatch.setenv("OPENAI_REASONING_EFFORT", "none")
-    assert sc.load_environment() == ("sk-test", "env-model", "none")
-    assert sc.load_environment("cli-model")[1] == "cli-model"
-
-
-def test_load_environment_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sc, "load_dotenv", lambda: None)
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with pytest.raises(ValueError):
-        sc.load_environment()
-
-
-def test_build_llm_avoids_unsupported_gpt5_params() -> None:
-    llm = sc.build_llm("sk-test", sc.DEFAULT_MODEL, "low")
-    assert llm.model_name == "gpt-5.6-luna"
-    assert llm.use_responses_api is True
-    assert llm.reasoning == {"effort": "low"}
-    assert llm.temperature is None
-    assert llm.max_tokens is None
-
-
-def test_run_preserves_bom_and_crlf(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    source = tmp_path / "in.srt"
-    source.write_bytes(codecs.BOM_UTF8 + SAMPLE.replace("\n", "\r\n").encode("utf-8"))
-    monkeypatch.setattr(sc, "load_dotenv", lambda: None)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-    monkeypatch.setattr(sc, "build_corrector", lambda *a: FakeCorrector(echo))
-
-    output = sc.run([str(source)])
-    assert output == tmp_path / "in_revised.srt"
-    assert output.read_bytes() == source.read_bytes()
-
-
 def test_collect_srt_recursively_and_deduplicate(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()

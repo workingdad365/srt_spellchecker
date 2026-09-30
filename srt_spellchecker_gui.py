@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import csv
 import io
-import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
 from PySide6.QtCore import QIODevice, QMimeData, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
@@ -28,7 +26,7 @@ from srt_spellchecker import (
 )
 
 
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 
 
 class FileTable(QTableWidget):
@@ -312,10 +310,7 @@ class MainWindow(QMainWindow):
             except SettingsError as error:
                 saved_key = None
                 startup_errors.append(str(error))
-            self.keys[service] = (
-                saved_key if saved_key is not None
-                else os.getenv(f"{service.upper()}_API_KEY", "").strip()
-            )
+            self.keys[service] = saved_key or ""
         self._persisted_keys = dict(self.keys)
         self.current_service = self.preferences.service
         self.key_save_timer = QTimer(self)
@@ -1124,7 +1119,6 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
-    load_dotenv()
     app = QApplication(sys.argv)
     app.setApplicationName("SRT Spellchecker")
     window = MainWindow()
