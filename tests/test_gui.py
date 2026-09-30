@@ -200,6 +200,29 @@ def test_evaluation_frequency_rounding_and_empty_text(window):
     assert [table.item(row, 3).text() for row in range(3)] == ["3000", "3001", "0"]
 
 
+def test_evaluation_double_click_opens_sorted_rows_file_and_folder(window, tmp_path, monkeypatch):
+    paths = [tmp_path / folder / "subtitle.srt" for folder in ("first", "second")]
+    table = window.evaluation_table
+    table.setRowCount(2)
+    for row, path in enumerate(paths):
+        item = gui.QTableWidgetItem(path.name)
+        item.setToolTip(str(path))
+        table.setItem(row, 0, item)
+        window._evaluation_result(row, "완료", gui.EvaluationResult(row + 1, 100))
+    table.setSortingEnabled(True)
+    table.sortItems(2, Qt.SortOrder.DescendingOrder)
+    assert table.item(0, 0).toolTip() == str(paths[1])
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
+    for column in range(5):
+        table.cellDoubleClicked.emit(0, column)
+    assert opened == [QUrl.fromLocalFile(str(paths[1])), QUrl.fromLocalFile(str(paths[1].parent))]
+    table.item(0, 0).setToolTip("")
+    table.cellDoubleClicked.emit(0, 0)
+    table.cellDoubleClicked.emit(0, 1)
+    assert len(opened) == 2
+
+
 def prepare_csv_table(window):
     window.evaluation_radio.click()
     table = window.evaluation_table

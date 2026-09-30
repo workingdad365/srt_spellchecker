@@ -458,6 +458,7 @@ class MainWindow(QMainWindow):
         self.table.cellDoubleClicked.connect(self.open_subtitle_target)
         splitter.addWidget(self.table)
         self.evaluation_table = QTableWidget(0, 5)
+        self.evaluation_table.cellDoubleClicked.connect(self.open_evaluation_target)
         self.evaluation_table.setHorizontalHeaderLabels([
             "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수",
         ])
@@ -890,6 +891,16 @@ class MainWindow(QMainWindow):
         if column not in (0, 1, 2):
             return
         item = self.table.item(row, 0 if column == 1 else column)
+        path = item.toolTip() if item is not None else ""
+        if path:
+            if column == 1:
+                path = str(Path(path).parent)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def open_evaluation_target(self, row: int, column: int) -> None:
+        if column not in (0, 1):
+            return
+        item = self.evaluation_table.item(row, 0)
         path = item.toolTip() if item is not None else ""
         if path:
             if column == 1:
