@@ -565,6 +565,41 @@ def test_gui_correction_flow(window, app, tmp_path, monkeypatch) -> None:
     assert window.worker is None
 
 
+@pytest.mark.parametrize(("batch_size", "expected_sizes"), [
+    (1, [1] * 27), (10, [10, 10, 7]), (25, [25, 2]), (200, [27]),
+])
+def test_gui_batch_size_controls_actual_requests(window, app, tmp_path, monkeypatch, batch_size, expected_sizes):
+    batches = []
+
+    def respond(payload):
+        batches.append(payload)
+        return echo(payload)
+
+    class Service(EchoService):
+        def __init__(self, *args):
+            FakeCorrector.__init__(self, respond)
+
+    monkeypatch.setattr(gui, "ServiceCorrector", Service)
+    source = tmp_path / "batches.srt"
+    content = "\n\n".join(
+        f"{index + 1}\n00:00:01,000 --> 00:00:02,000\n자막 {index + 1}"
+        for index in range(27)
+    ) + "\n"
+    source.write_text(content, encoding="utf-8")
+    window._files_loaded([source])
+    prepare_model(window)
+    assert window.batch_size_spin.value() == 25
+    window.batch_size_spin.setValue(batch_size)
+    window.start_correction()
+    finish_work(window, app)
+    assert [len(batch) for batch in batches] == expected_sizes
+    assert [item["id"] for batch in batches for item in batch] == list(range(27))
+    assert source.with_stem("batches_revised").read_text(encoding="utf-8") == content
+    assert window.table.item(0, 1).text() == "완료"
+    assert window.progress_bar.value() == 1000
+    assert f"[배치 크기] 요청당 자막 {batch_size}개" in window.log_view.toPlainText()
+
+
 @pytest.mark.parametrize("limit", [2, 3])
 def test_concurrent_correction_limit_refill_and_progress(window, app, tmp_path, monkeypatch, limit):
     paths = [tmp_path / f"{index}.srt" for index in range(limit + 2)]
@@ -584,6 +619,7 @@ def test_concurrent_correction_limit_refill_and_progress(window, app, tmp_path, 
 
     def correct_file(path, corrector, *_args, **kwargs):
         nonlocal peak
+        assert kwargs["batch_size"] == 10
         with lock:
             active.add(path)
             peak = max(peak, len(active))
@@ -602,6 +638,7 @@ def test_concurrent_correction_limit_refill_and_progress(window, app, tmp_path, 
     window._files_loaded(paths)
     prepare_model(window)
     window.concurrency_spin.setValue(limit)
+    window.batch_size_spin.setValue(10)
     window.start_correction()
     try:
         wait_until(lambda: all(entered[path].is_set() for path in paths[:limit]))
@@ -609,6 +646,7 @@ def test_concurrent_correction_limit_refill_and_progress(window, app, tmp_path, 
         assert len(window.correction_workers) == limit
         assert not entered[paths[limit]].is_set()
         assert not window.concurrency_spin.isEnabled()
+        assert not window.batch_size_spin.isEnabled()
         assert not window.correction_radio.isEnabled()
         release[paths[0]].set()
         wait_until(entered[paths[limit]].is_set)
@@ -1157,6 +1195,7 @@ def test_settings_restore_after_close(window, app, isolated_settings) -> None:
     window.wrap_check.setChecked(True)
     window.length_spin.setValue(32)
     window.concurrency_spin.setValue(3)
+    window.batch_size_spin.setValue(50)
     window.show_key.setChecked(True)
     window.close()
     restored = gui.MainWindow()
@@ -1168,6 +1207,7 @@ def test_settings_restore_after_close(window, app, isolated_settings) -> None:
         assert restored.wrap_check.isChecked()
         assert restored.length_spin.value() == 32
         assert restored.concurrency_spin.value() == 3
+        assert restored.batch_size_spin.value() == 50
         assert restored.key_edit.echoMode() == QLineEdit.EchoMode.Password
         restored.service_combo.setCurrentText("OpenAI")
         assert restored.selected_model().id == "test-model"
@@ -1185,11 +1225,13 @@ def test_preferences_save_before_close(window) -> None:
     window.wrap_check.setChecked(True)
     window.length_spin.setValue(40)
     window.concurrency_spin.setValue(2)
+    window.batch_size_spin.setValue(40)
     saved = window.settings.load_preferences()
     assert saved.models["OpenAI"].id == "test-model"
     assert saved.wrap is True
     assert saved.max_line_length == 40
     assert saved.concurrent_files == 2
+    assert saved.batch_size == 40
 
 
 def test_key_edit_saves_and_clears_credentials(window) -> None:

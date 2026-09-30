@@ -23,7 +23,7 @@ from ai_services import BASE_URLS, ModelInfo, ServiceCorrector, fetch_models, re
 from app_settings import AppSettings, Preferences, SavedModel, SavedWorkFile, SavedWorklist, SettingsError
 from spacing_evaluation import EvaluationResult, create_spacer, evaluate_file
 from srt_spellchecker import (
-    DEFAULT_MAX_LINE_LENGTH, FATAL_API_ERRORS, CorrectionCancelled,
+    BATCH_SIZE, DEFAULT_MAX_LINE_LENGTH, FATAL_API_ERRORS, MAX_BATCH_SIZE, CorrectionCancelled,
     check_cancelled, collect_srt_files, correct_file,
 )
 
@@ -141,6 +141,7 @@ class CorrectionWorker(QThread):
     def __init__(
         self, paths: list[Path], service: str, api_key: str, model: ModelInfo,
         wrap_length: int | None, parent: QWidget | None = None,
+        *, batch_size: int = BATCH_SIZE,
     ) -> None:
         super().__init__(parent)
         self.paths = list(paths)
@@ -148,6 +149,7 @@ class CorrectionWorker(QThread):
         self.api_key = api_key
         self.model = model
         self.wrap_length = wrap_length
+        self.batch_size = batch_size
         self.aborted = False
 
     def write_log(self, message: str) -> None:
@@ -168,6 +170,7 @@ class CorrectionWorker(QThread):
                 try:
                     output, logs = correct_file(
                         path, corrector, self.wrap_length,
+                        batch_size=self.batch_size,
                         on_log=self.write_log,
                         on_progress=lambda done, total, file_index=index: self.progress.emit(
                             int((file_index + done / total) / len(self.paths) * 1000)
@@ -329,6 +332,7 @@ class MainWindow(QMainWindow):
         self.wrap_check.setChecked(self.preferences.wrap)
         self.length_spin.setValue(self.preferences.max_line_length)
         self.concurrency_spin.setValue(self.preferences.concurrent_files)
+        self.batch_size_spin.setValue(self.preferences.batch_size)
         self._restore_model()
         try:
             self._restore_worklist()
@@ -414,6 +418,13 @@ class MainWindow(QMainWindow):
         self.concurrency_spin.setToolTip("동시에 교정할 파일 수. 1개는 순차 처리, 변경값은 다음 교정부터 적용")
         self.concurrency_spin.valueChanged.connect(self._save_preferences)
         form.addRow("동시 교정 파일 수", self.concurrency_spin)
+        self.batch_size_spin = QSpinBox()
+        self.batch_size_spin.setRange(1, MAX_BATCH_SIZE)
+        self.batch_size_spin.setValue(BATCH_SIZE)
+        self.batch_size_spin.setSuffix(" 개")
+        self.batch_size_spin.setToolTip("API 요청 한 번에 보낼 자막 블록 수. 기본 25개, 변경값은 다음 교정부터 적용")
+        self.batch_size_spin.valueChanged.connect(self._save_preferences)
+        form.addRow("요청당 자막 수", self.batch_size_spin)
         root.addWidget(self.settings_panel)
 
         tools = QHBoxLayout()
@@ -646,6 +657,7 @@ class MainWindow(QMainWindow):
         self.preferences.wrap = self.wrap_check.isChecked()
         self.preferences.max_line_length = self.length_spin.value()
         self.preferences.concurrent_files = self.concurrency_spin.value()
+        self.preferences.batch_size = self.batch_size_spin.value()
         try:
             self.settings.save_preferences(self.preferences)
         except SettingsError as error:
@@ -914,6 +926,7 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(f"[모델] {self.current_service} / {model.id}")
         self.log_view.appendPlainText(f"[추론] {reasoning_label(self.current_service, model)}")
         self.log_view.appendPlainText(f"[동시 교정] 최대 {self.concurrency_spin.value()}개 파일")
+        self.log_view.appendPlainText(f"[배치 크기] 요청당 자막 {self.batch_size_spin.value()}개")
         self._advance_correction()
 
     def start_evaluation(self) -> None:
@@ -1011,6 +1024,7 @@ class MainWindow(QMainWindow):
         worker = CorrectionWorker(
             [path], self.current_service, self.key_edit.text().strip(), model,
             self.length_spin.value() if self.wrap_check.isChecked() else None, self,
+            batch_size=self.batch_size_spin.value(),
         )
         self.correction_workers[path] = worker
         worker.log.connect(lambda message: self.log_view.appendPlainText(f"[{path}] {message}"))

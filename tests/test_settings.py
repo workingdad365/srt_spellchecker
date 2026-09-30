@@ -71,7 +71,7 @@ def test_preferences_round_trip_preserves_model_metadata(tmp_path) -> None:
         "supported_parameters": ["structured_outputs"],
         "unused_field": "not saved",
     })
-    preferences = settings.Preferences(service="OpenRouter", wrap=True, max_line_length=30, concurrent_files=3)
+    preferences = settings.Preferences(service="OpenRouter", wrap=True, max_line_length=30, concurrent_files=3, batch_size=50)
     preferences.models["OpenRouter"] = settings.SavedModel.from_model(model)
     store.save_preferences(preferences)
     restored = settings.AppSettings(QSettings(path, QSettings.Format.IniFormat)).load_preferences()
@@ -115,12 +115,22 @@ def test_vault_failure_does_not_leak_secret_or_fallback(tmp_path, monkeypatch) -
 @pytest.mark.parametrize("raw", [
     "not-json", '{"service":"unknown"}', '{"max_line_length":0}',
     '{"concurrent_files":0}', '{"concurrent_files":33}',
+    '{"batch_size":0}', '{"batch_size":201}',
 ])
 def test_invalid_preferences_report_error(tmp_path, raw) -> None:
     store = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
     store.store.setValue("preferences", raw)
     with pytest.raises(settings.SettingsError):
         store.load_preferences()
+
+
+def test_old_preferences_default_to_25_subtitles_per_request(tmp_path):
+    store = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    store.store.setValue("preferences", '{"service":"OpenRouter","concurrent_files":3}')
+    restored = store.load_preferences()
+    assert restored.batch_size == 25
+    assert restored.service == "OpenRouter"
+    assert restored.concurrent_files == 3
 
 
 def test_preferences_write_error_is_reported(tmp_path, monkeypatch) -> None:

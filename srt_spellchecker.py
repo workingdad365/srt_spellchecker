@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 DEFAULT_MODEL = "gpt-5.6-luna"
 DEFAULT_REASONING_EFFORT = "low"
 BATCH_SIZE = 25
+MAX_BATCH_SIZE = 200
 ATTEMPT_LIMIT = 3
 DEFAULT_MAX_LINE_LENGTH = 23
 MAX_WRAPPED_LINES = 2
@@ -648,6 +649,7 @@ def correct_file(
     corrector: Any,
     wrap_length: int | None = None,
     *,
+    batch_size: int = BATCH_SIZE,
     overwrite: bool = False,
     on_log: Callable[[str], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
@@ -657,7 +659,7 @@ def correct_file(
     content, encoding = decode_srt(input_path.read_bytes())
     blocks = parse_srt_blocks(content)
     revised, logs = revise_subtitles(
-        blocks, corrector, wrap_length,
+        blocks, corrector, wrap_length, batch_size=batch_size,
         on_log=on_log, on_progress=on_progress, is_cancelled=is_cancelled,
     )
     check_cancelled(is_cancelled)

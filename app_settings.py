@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field, ValidationError
 from PySide6.QtCore import QIODevice, QSaveFile, QSettings, QStandardPaths
 
 from ai_services import ModelInfo
-from srt_spellchecker import DEFAULT_MAX_LINE_LENGTH
+from srt_spellchecker import BATCH_SIZE, DEFAULT_MAX_LINE_LENGTH, MAX_BATCH_SIZE
 
 
 class SettingsError(Exception):
@@ -42,6 +42,7 @@ class Preferences(BaseModel):
     wrap: bool = False
     max_line_length: int = Field(default=DEFAULT_MAX_LINE_LENGTH, ge=1, le=200)
     concurrent_files: int = Field(default=1, ge=1, le=32)
+    batch_size: int = Field(default=BATCH_SIZE, ge=1, le=MAX_BATCH_SIZE)
 
 
 class SavedWorkFile(BaseModel):
