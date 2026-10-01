@@ -567,20 +567,27 @@ class EchoService(FakeCorrector):
         pass
 
 
-def test_gui_correction_flow(window, app, tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(("content", "expected_state"), [
+    (SAMPLE, "검토 필요"),
+    (SAMPLE.replace("메모 블록\n\n", ""), "완료"),
+])
+def test_gui_correction_flow(window, app, tmp_path, monkeypatch, content, expected_state) -> None:
     monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
     source = tmp_path / "subtitle.srt"
-    source.write_text(SAMPLE, encoding="utf-8")
+    source.write_text(content, encoding="utf-8")
     window._files_loaded([source])
     prepare_model(window)
     assert window.start_button.isEnabled()
     window.start_button.click()
     assert not window.start_button.isEnabled()
     finish_work(window, app)
-    assert window.table.item(0, 1).text() == "완료"
+    assert window.table.item(0, 1).text() == expected_state
+    assert window.table.cellWidget(0, 3).isEnabled() == (expected_state == "검토 필요")
+    if expected_state == "검토 필요":
+        assert "자막 #1 뒤 비자막 블록 2 (1줄)" in window.review_results[source][1][0]
     assert window.table.item(0, 0).text() == str(Path(tmp_path.name) / "subtitle.srt")
     assert window.table.item(0, 2).text() == str(Path(tmp_path.name) / "subtitle_revised.srt")
-    assert (tmp_path / "subtitle_revised.srt").read_text(encoding="utf-8") == SAMPLE
+    assert (tmp_path / "subtitle_revised.srt").read_text(encoding="utf-8") == content
     assert window.progress_bar.value() == 1000
     assert "저장 1개" in window.status_label.text()
     assert not window.start_button.isEnabled()
@@ -1114,7 +1121,7 @@ def test_file_error_does_not_stop_next_file(window, app, tmp_path, monkeypatch) 
     window.start_correction()
     finish_work(window, app)
     assert window.table.item(0, 1).text() == "실패"
-    assert window.table.item(1, 1).text() == "완료"
+    assert window.table.item(1, 1).text() == "검토 필요"
 
 
 def test_auth_error_stops_queue(window, app, tmp_path, monkeypatch) -> None:

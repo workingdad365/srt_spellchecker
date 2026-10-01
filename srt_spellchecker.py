@@ -593,6 +593,15 @@ def correct_file(
         on_log=on_log, on_progress=on_progress, is_cancelled=is_cancelled,
     )
     check_cancelled(is_cancelled)
+    location = "파일 시작 부분"
+    for block_number, block in enumerate(revised, start=1):
+        if block.is_subtitle:
+            location = f"자막 #{(block.sequence or '').strip()} 뒤"
+        elif any(line.strip() for line in block.raw_lines):
+            logs.append(
+                f"[확인필요] {location} 비자막 블록 {block_number} ({len(block.raw_lines)}줄): "
+                "빈 줄로 분리된 자막 본문일 수 있어 수동 확인 필요"
+            )
     data = render_srt(revised, detect_newline(content)).encode(encoding)
     output = output_path_for(input_path)
     number = 1

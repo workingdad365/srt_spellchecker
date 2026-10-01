@@ -773,6 +773,55 @@ def test_collect_can_cancel_within_large_directory(tmp_path, monkeypatch):
     assert counts[-1] == 1
 
 
+@pytest.mark.parametrize("wrap_length", [None, 23])
+@pytest.mark.parametrize("response_kind", ["echo", "missing", "failed"])
+def test_correct_file_reviews_detached_paragraphs(tmp_path: Path, monkeypatch, wrap_length, response_kind) -> None:
+    content = (
+        "1\n00:00:01,000 --> 00:00:02,000\n첫 문장\n\n"
+        "번역 안내\n\n첫 설명\n둘째 설명\n셋째 설명\n넷째 설명\n\n배포 안내\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n다음 자막\n"
+    )
+    source = tmp_path / "in.srt"
+    source.write_bytes(content.encode("utf-8"))
+    monkeypatch.setattr(sc, "ATTEMPT_LIMIT", 1)
+
+    def responder(payload):
+        if response_kind == "failed":
+            return RuntimeError("failed")
+        if response_kind == "missing":
+            return ok([])
+        return echo(payload)
+
+    output, logs = sc.correct_file(source, FakeCorrector(responder), wrap_length=wrap_length)
+    assert source.read_bytes() == content.encode("utf-8")
+    assert output.read_bytes() == source.read_bytes()
+    assert [log for log in logs if log.startswith("[확인필요]")] == [
+        f"[확인필요] 자막 #1 뒤 비자막 블록 {block_number} ({line_count}줄): "
+        "빈 줄로 분리된 자막 본문일 수 있어 수동 확인 필요"
+        for block_number, line_count in [(2, 1), (3, 4), (4, 1)]
+    ]
+
+
+@pytest.mark.parametrize("subtitle", ["", "\n\n1\n00:00:01,000 --> 00:00:02,000\n본문"])
+def test_correct_file_reviews_leading_non_subtitle_text(tmp_path: Path, subtitle) -> None:
+    source = tmp_path / "in.srt"
+    source.write_bytes(("안내문" + subtitle + "\n").encode("utf-8"))
+    output, logs = sc.correct_file(source, FakeCorrector(echo))
+    assert output.read_bytes() == source.read_bytes()
+    assert logs == [
+        "[확인필요] 파일 시작 부분 비자막 블록 1 (1줄): "
+        "빈 줄로 분리된 자막 본문일 수 있어 수동 확인 필요"
+    ]
+
+
+def test_correct_file_without_non_subtitle_text_has_no_structure_review(tmp_path: Path) -> None:
+    source = tmp_path / "in.srt"
+    source.write_bytes("1\n00:00:01,000 --> 00:00:02,000\n본문\n".encode("utf-8"))
+    output, logs = sc.correct_file(source, FakeCorrector(echo))
+    assert output.read_bytes() == source.read_bytes()
+    assert logs == []
+
+
 def test_correct_file_keeps_existing_outputs_and_encoding(tmp_path: Path) -> None:
     source = tmp_path / "in.srt"
     source.write_bytes(codecs.BOM_UTF8 + SAMPLE.replace("\n", "\r\n").encode("utf-8"))
@@ -786,7 +835,10 @@ def test_correct_file_keeps_existing_outputs_and_encoding(tmp_path: Path) -> Non
     assert output.read_bytes() == source.read_bytes()
     assert existing.read_text() == "keep"
     assert progress == [(1, 1)]
-    assert logs == []
+    assert logs == [
+        "[확인필요] 자막 #1 뒤 비자막 블록 2 (1줄): "
+        "빈 줄로 분리된 자막 본문일 수 있어 수동 확인 필요"
+    ]
 
 
 def test_cancel_after_request_does_not_write_file(tmp_path: Path) -> None:
