@@ -402,6 +402,65 @@ def test_reported_valid_line_changes_are_accepted(original, response, wrap_lengt
     assert sc.sanitize_lines(original, response, wrap_length) == (expected, [])
 
 
+@pytest.mark.parametrize("wrap_length", [None, 80])
+@pytest.mark.parametrize(("sequence", "original", "response"), [
+    ("255", ["- <i>인터뷰같은거 말이지</i>", "<i>- 인터뷰? 앙?</i>"],
+     ["- <i>인터뷰 같은 거 말이지</i>", "- <i>인터뷰? 앙?</i>"]),
+    ("448", ["- <i>아...</i>", "<i>- 움직이지 마</i>"],
+     ["<i>- 아...</i>", "<i>- 움직이지 마</i>"]),
+    ("465", ["- <i>사샤</i>", "<i>- 디마! 조심해!</i>"],
+     ["- <i>사샤</i>", "- <i>디마! 조심해!</i>"]),
+    ("482", ["<i>- 수류탄!</i>", "<i>- 던져!</i>"],
+     ["- <i>수류탄!</i>", "- <i>던져!</i>"]),
+    ("527", ["- <i>좋아</i>", "<i>- 디마...</i>"],
+     ["- <i>좋아</i>", "- <i>디마...</i>"]),
+    ("607", ["- <i>박사의 연구소가 이 밑에 있을거야</i>", "<i>- 물론이지, 디마</i>"],
+     ["- <i>박사의 연구소가 이 밑에 있을 거야</i>", "- <i>물론이지, 디마</i>"]),
+    ("682", ["- <i>네</i>", "<i>- 좋아</i>"],
+     ["- <i>네</i>", "- <i>좋아</i>"]),
+    ("712", ["- <i>네</i>", "<i>- 그들은 심지어 식욕도있어</i>"],
+     ["- <i>네</i>", "- <i>그들은 심지어 식욕도 있어</i>"]),
+    ("734", ["- <i>네 보고있습니다</i>", "<i>- 봐봐</i>"],
+     ["- <i>네, 보고 있습니다</i>", "- <i>봐봐</i>"]),
+    ("772", ["- <i>준비됐나?</i>", "<i>- 네</i>"],
+     ["- <i>준비됐나?</i>", "- <i>네</i>"]),
+    ("804", ["- <i>네 희생을 결코 잊지않을게</i>", "<i>- 디마!</i>"],
+     ["- <i>네 희생을 결코 잊지 않을게</i>", "- <i>디마!</i>"]),
+])
+def test_reported_html_dialogue_marker_relocation_is_accepted(sequence, original, response, wrap_length):
+    source = sequence + "\n00:00:01,000 --> 00:00:02,000\n" + "\n".join(original) + "\n"
+    blocks = sc.parse_srt_blocks(source)
+    corrector = FakeCorrector(lambda payload: ok([
+        {"id": payload[0]["id"], "corrected_lines": response},
+    ]))
+    revised, logs = sc.revise_subtitles(blocks, corrector, wrap_length=wrap_length)
+    assert revised[0].text_lines == response
+    assert revised[0].sequence == sequence
+    assert revised[0].timecode == blocks[0].timecode
+    assert logs == []
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(("inside", "outside"), [
+    ('<i><font color="yellow">- 안녕</font></i>', '- <i><font color="yellow">안녕</font></i>'),
+    ('<i>- <font color="yellow">안녕</font></i>', '- <i><font color="yellow">안녕</font></i>'),
+    ("<i>/ 안녕</i>", "- <i>안녕</i>"),
+])
+def test_nested_html_dialogue_marker_relocation_is_accepted(inside, outside, reverse):
+    original, response = ([inside, "- 반가워"], [outside, "- 반가워"])
+    if reverse:
+        original, response = response, original
+    assert sc.sanitize_lines(original, response, None) == (response, [])
+
+
+def test_html_dialogue_marker_relocation_keeps_length_review():
+    original = ["<i>- 안녕하세요</i>", "<i>- 반갑습니다</i>"]
+    response = ["- <i>안녕하세요</i>", "- <i>반갑습니다</i>"]
+    assert sc.sanitize_lines(original, response, 8) == (
+        response, ["[확인필요] 8자/2줄 초과: 대사·서식 구분 유지"],
+    )
+
+
 @pytest.mark.parametrize("wrap_length", [None, 23])
 @pytest.mark.parametrize(("original", "response"), [
     (["- 카메라야!", "- 8mm야!", "- 영화야!"], ["- 카메라야!", "- 8mm야! 영화야!"]),
@@ -409,6 +468,12 @@ def test_reported_valid_line_changes_are_accepted(original, response, wrap_lengt
      ["- 하나가 되었다", "- 어! 잘 부탁해! 어!"]),
     (["<i>하나가 되었다</i>", "- 어!"], ["- 하나가 되었다", "- 어!"]),
     (["<i>하나가 되었다</i>", "- 어!"], ["- <i>하나가 되었다</i>", "- 어!"]),
+    (["<i>하나가 되었다</i>", "- 어!"], ["<i>- 하나가 되었다</i>", "- 어!"]),
+    (["<i>- 안녕</i>", "- 어!"], ["<i>안녕</i>", "- 어!"]),
+    (["- <i>안녕</i>", "- 어!"], ["<i>안녕</i>", "- 어!"]),
+    (["<i>- 안녕</i>", "- 어!"], ["- <b>안녕</b>", "- 어!"]),
+    (['<font color="yellow">- 안녕</font>', "- 어!"], ['- <font color="red">안녕</font>', "- 어!"]),
+    (["<i>- 안녕</i>", "<i>- 반가워</i>"], ["- <i>안녕 반가워</i>"]),
 ])
 def test_merged_speech_or_changed_caption_boundary_reverts(original, response, wrap_length):
     lines, notes = sc.sanitize_lines(original, response, wrap_length)
@@ -569,7 +634,12 @@ def test_request_includes_language_normalization_rules(wrap_length) -> None:
     class CheckingCorrector(FakeCorrector):
         def invoke(self, messages):
             system_prompt = messages[0][1]
-            assert "비속어와 욕설은 문맥에 맞는 순화어로" in system_prompt
+            assert "강한 비속어와 욕설만 문맥에 맞게 완화한다" in system_prompt
+            assert "'젠장', '제길', '놈', '자식' 정도의 가벼운 비속어는 허용" in system_prompt
+            assert "원문에 있으면 삭제하거나 더 점잖은 말로 바꾸지 않는다" in system_prompt
+            assert "강한 욕설을 완화할 때도 이런 가벼운 비속어를 사용할 수" in system_prompt
+            assert "분노와 거친 말투를 과도하게 약화하지 않는다" in system_prompt
+            assert "원문보다 공격성을 높이거나 불필요한 비속어를 덧붙이지 않는다" in system_prompt
             assert "사투리의 어휘와 어미는 자연스러운 표준어로" in system_prompt
             assert "원래 뜻과 감정, 존댓말과 반말의 구분을 유지" in system_prompt
             assert "정상적인 단어나 고유명사를 바꾸지 않는다" in system_prompt

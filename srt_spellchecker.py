@@ -246,10 +246,11 @@ def sanitize_lines(
         candidate = format_subtitle_segments(response_segments)
         # 서식은 설명 자막의 단서일 수 있으므로 같은 위치에 유지한다.
         tags = lambda line: re.findall(r"<[^>]+>|\{\\[^}]+\}", line)
+        dialogue_marker = re.compile(r"^\s*(?:<[A-Za-z][^>]*>\s*)*[-/]")
         valid = len(candidate) == len(original_lines) and all(
             re.sub(r"^[-/]\s*", "", new.strip(), count=1).strip()
             and tags(old) == tags(new)
-            and (not tags(old) or bool(re.match(r"^\s*[-/]", old)) == bool(re.match(r"^\s*[-/]", new)))
+            and (not tags(old) or bool(dialogue_marker.match(old)) == bool(dialogue_marker.match(new)))
             for old, new in zip(original_lines, candidate)
         )
         if not valid:
@@ -259,7 +260,7 @@ def sanitize_lines(
             # 응답에서 생략된 대사 표식도 원본 구분에 맞춰 복구한다.
             result = [
                 "- " + re.sub(r"^[-/]\s*", "", new.strip(), count=1)
-                if old.startswith("- ") else new
+                if old.startswith("- ") and not tags(old) else new
                 for old, new in zip(original_lines, candidate)
             ]
         if wrap_length is not None and any(len(line) > wrap_length for line in result):
@@ -302,7 +303,11 @@ def build_messages(
         "당신은 한국어 자막 교정 전문가다. "
         "OCR로 생성된 SRT 자막 문장을 문맥에 맞게 교정한다. "
         "오타, 띄어쓰기, 잘못 인식된 글자를 자연스럽게 수정하되 원래 의미는 유지한다. "
-        "비속어와 욕설은 문맥에 맞는 순화어로 바꾸고, 사투리의 어휘와 어미는 자연스러운 표준어로 바꾼다. "
+        "강한 비속어와 욕설만 문맥에 맞게 완화한다. "
+        "'젠장', '제길', '놈', '자식' 정도의 가벼운 비속어는 허용하며, 원문에 있으면 삭제하거나 더 점잖은 말로 바꾸지 않는다. "
+        "강한 욕설을 완화할 때도 이런 가벼운 비속어를 사용할 수 있으며, 분노와 거친 말투를 과도하게 약화하지 않는다. "
+        "원문보다 공격성을 높이거나 불필요한 비속어를 덧붙이지 않는다. "
+        "사투리의 어휘와 어미는 자연스러운 표준어로 바꾼다. "
         "순화와 표준어 변환 시 원래 뜻과 감정, 존댓말과 반말의 구분을 유지하고 "
         "대사를 삭제하거나 새로운 내용을 덧붙이지 않는다. "
         "단어의 일부가 비속어와 같다는 이유만으로 정상적인 단어나 고유명사를 바꾸지 않는다. "
