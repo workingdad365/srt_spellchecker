@@ -162,6 +162,85 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
     assert window.table.item(0, 2).text() == str(Path(tmp_path.name) / "two_revised.srt")
 
 
+@pytest.mark.parametrize(("threshold", "kept_indices"), [
+    (0.0, [0, 1, 2, 3, 6]), (0.33, [1, 2, 3]), (101.0, []),
+])
+def test_evaluation_threshold_filters_correction_targets(window, app, tmp_path, monkeypatch, threshold, kept_indices):
+    paths = [tmp_path / name for name in (
+        "below.srt", "equal.srt", "above.srt", "high.srt", "empty.srt", "failed.srt", "zero.srt",
+    )]
+    content = "1\n00:00:01,000 --> 00:00:02,000\n본문\n"
+    for path in paths:
+        path.write_text(content, encoding="utf-8")
+    results = [
+        gui.EvaluationResult(1, 3031), gui.EvaluationResult(33, 100000),
+        gui.EvaluationResult(1, 3000), gui.EvaluationResult(10, 100),
+        gui.EvaluationResult(0, 0), None, gui.EvaluationResult(0, 100),
+    ]
+    monkeypatch.setattr(gui, "create_spacer", object)
+
+    def evaluate(path, _spacer, **_kwargs):
+        result = results[paths.index(path)]
+        if result is None:
+            raise ValueError("평가 실패")
+        return result
+
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    window._files_loaded(paths)
+    for path in paths:
+        window._store_review(path, "", ["기존 검토 기록"])
+    window.evaluation_radio.click()
+    assert not window.filter_evaluation_button.isEnabled()
+    window.start_evaluation()
+    assert not window.filter_evaluation_button.isEnabled()
+    finish_work(window, app)
+    window.evaluation_table.sortItems(4, Qt.SortOrder.DescendingOrder)
+    window.evaluation_threshold_spin.setValue(threshold)
+    assert window.filter_evaluation_button.isEnabled()
+    window.resize(720, 620)
+    window.show()
+    app.processEvents()
+    panel = window.evaluation_filter_panel
+    spin = window.evaluation_threshold_spin
+    button = window.filter_evaluation_button
+    assert panel.rect().contains(spin.geometry())
+    assert panel.rect().contains(button.geometry())
+    assert not spin.geometry().intersects(button.geometry())
+    window.filter_evaluation_button.click()
+    expected = [paths[index] for index in kept_indices]
+    assert window.paths == expected
+    assert window.table.rowCount() == len(expected)
+    assert window.evaluation_table.rowCount() == len(expected)
+    assert {
+        window.evaluation_table.item(row, 0).toolTip() for row in range(len(expected))
+    } == {str(path) for path in expected}
+    assert window.count_label.text() == f"자막 {len(expected)}개"
+    assert set(window.review_results) == set(expected)
+    assert [item.path for item in window.settings.load_worklist().files] == [str(path) for path in expected]
+    assert window.export_button.isEnabled() == bool(expected)
+    assert window.filter_evaluation_button.isEnabled() == bool(expected)
+    window.filter_evaluation_results()
+    assert window.paths == expected
+    assert all(path.read_text(encoding="utf-8") == content for path in paths)
+    corrected = []
+
+    def correct(path, _corrector, _wrap_length, **_kwargs):
+        corrected.append(path)
+        return path.with_stem(path.stem + "_revised"), []
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", correct)
+    window.correction_radio.click()
+    assert window.evaluation_filter_panel.isHidden()
+    assert not window.filter_evaluation_button.isEnabled()
+    prepare_model(window)
+    assert window.start_button.isEnabled() == bool(expected)
+    window.start_correction()
+    finish_work(window, app)
+    assert set(corrected) == set(expected)
+    assert len(corrected) == len(expected)
+
+
 def test_evaluation_sorts_only_when_finished(window, app, tmp_path, monkeypatch):
     paths = [tmp_path / "first.srt", tmp_path / "second.srt"]
     window._files_loaded(paths)
@@ -182,6 +261,9 @@ def test_evaluation_sorts_only_when_finished(window, app, tmp_path, monkeypatch)
         assert window.evaluation_table.item(0, 0).text() == str(Path(tmp_path.name) / "first.srt")
         assert not window.files_button.isEnabled()
         assert not window.evaluation_table.isSortingEnabled()
+        assert not window.filter_evaluation_button.isEnabled()
+        window.filter_evaluation_results()
+        assert window.paths == paths
     finally:
         release.set()
         finish_work(window, app)

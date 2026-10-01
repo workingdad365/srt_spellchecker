@@ -10,7 +10,7 @@ from typing import Any
 from PySide6.QtCore import QIODevice, QMimeData, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QDoubleSpinBox,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
     QSizePolicy, QSpinBox, QSplitter, QStyle, QTableWidget, QTableWidgetItem, QToolButton,
@@ -451,6 +451,29 @@ class MainWindow(QMainWindow):
         self.loading_panel.hide()
         root.addWidget(self.loading_panel)
 
+        self.evaluation_filter_panel = QWidget()
+        filter_layout = QHBoxLayout(self.evaluation_filter_panel)
+        filter_layout.setContentsMargins(0, 0, 0, 0)
+        threshold_label = QLabel("1,000자당 오류 수")
+        self.evaluation_threshold_spin = QDoubleSpinBox()
+        self.evaluation_threshold_spin.setRange(0, 1_000_000)
+        self.evaluation_threshold_spin.setDecimals(2)
+        self.evaluation_threshold_spin.setSuffix(" 이상")
+        self.evaluation_threshold_spin.setAccessibleName("남길 최소 1,000자당 오류 수")
+        threshold_label.setBuddy(self.evaluation_threshold_spin)
+        self.filter_evaluation_button = self._button(
+            "기준 이상만 남기기", QStyle.StandardPixmap.SP_DialogDiscardButton, self.filter_evaluation_results,
+        )
+        self.filter_evaluation_button.setToolTip(
+            "반올림 전 오류율로 비교. 기준 미만과 평가 실패·미평가·오류율 없는 항목을 두 목록에서 제거. 원본 파일 유지"
+        )
+        filter_layout.addWidget(threshold_label)
+        filter_layout.addWidget(self.evaluation_threshold_spin)
+        filter_layout.addWidget(self.filter_evaluation_button)
+        filter_layout.addStretch()
+        self.evaluation_filter_panel.hide()
+        root.addWidget(self.evaluation_filter_panel)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.table = FileTable()
         self.table.paths_dropped.connect(self.add_paths)
@@ -530,6 +553,7 @@ class MainWindow(QMainWindow):
         self.length_spin.setVisible(not evaluation)
         self.evaluation_table.setVisible(evaluation)
         self.export_button.setVisible(evaluation)
+        self.evaluation_filter_panel.setVisible(evaluation)
         for column in (1, 2, 3):
             self.table.setColumnHidden(column, evaluation)
         self.start_button.setText("평가 시작" if evaluation else "교정 시작")
@@ -553,6 +577,10 @@ class MainWindow(QMainWindow):
         self.clear_button.setEnabled(not busy and bool(self.paths))
         self.export_button.setEnabled(
             not busy and self.evaluation_radio.isChecked() and self.evaluation_table.rowCount() > 0
+        )
+        self.evaluation_filter_panel.setEnabled(
+            not busy and not self.close_pending and self.evaluation_radio.isChecked()
+            and self.evaluation_table.isSortingEnabled() and self.evaluation_table.rowCount() > 0
         )
         self.start_button.setEnabled(
             not busy and (
@@ -962,6 +990,45 @@ class MainWindow(QMainWindow):
         self.evaluation_table.setItem(row, 4, EvaluationNumberItem(
             result.errors_per_1000 if result else None, decimals=2,
         ))
+
+    def filter_evaluation_results(self) -> None:
+        if not self.filter_evaluation_button.isEnabled():
+            return
+        threshold = self.evaluation_threshold_spin.value()
+        kept_paths: set[Path] = set()
+        table = self.evaluation_table
+        for row in range(table.rowCount()):
+            path_item = table.item(row, 0)
+            state_item = table.item(row, 1)
+            rate_item = table.item(row, 4)
+            if path_item is None or state_item is None or rate_item is None:
+                continue
+            rate = rate_item.data(Qt.ItemDataRole.UserRole)
+            if state_item.text() == "완료" and rate is not None and rate >= threshold and path_item.toolTip():
+                kept_paths.add(Path(path_item.toolTip()))
+        kept_paths.intersection_update(self.paths)
+        removed_count = len(self.paths) - len(kept_paths)
+        for row in range(len(self.paths) - 1, -1, -1):
+            path = self.paths[row]
+            if path not in kept_paths:
+                self.review_results.pop(path, None)
+                self._attempted_paths.discard(path)
+                self._file_progress.pop(path, None)
+                del self.paths[row]
+                self.table.removeRow(row)
+        self._session_paths = [path for path in self._session_paths if path in kept_paths]
+        for row in range(table.rowCount() - 1, -1, -1):
+            item = table.item(row, 0)
+            if item is None or not item.toolTip() or Path(item.toolTip()) not in kept_paths:
+                table.removeRow(row)
+        message = (
+            f"평가 필터: 1,000자당 오류 수 {threshold:.2f} 이상, "
+            f"유지 {len(self.paths)}개 / 목록 제거 {removed_count}개"
+        )
+        self.status_label.setText(message)
+        self.log_view.appendPlainText(message)
+        self._update_controls()
+        self._save_worklist()
 
     def export_evaluation_csv(self) -> None:
         if not self.export_button.isEnabled():
