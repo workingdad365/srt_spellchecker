@@ -255,7 +255,7 @@ class EvaluationWorker(QThread):
         self.paths = list(paths)
 
     def run(self) -> None:
-        completed = partial = failed = errors = 0
+        completed = partial = reviewed = failed = errors = 0
         try:
             check_cancelled(self.isInterruptionRequested)
             spacer = create_spacer()
@@ -268,9 +268,14 @@ class EvaluationWorker(QThread):
                         on_progress=lambda done, total, row=index: self.progress.emit(
                             int((row + done / total) / len(self.paths) * 1000)
                         ),
+                        on_log=self.log.emit,
                     )
                     for warning in result.warnings:
                         self.log.emit(f"[제외] {path}: {warning}")
+                    if result.review_logs:
+                        reviewed += 1
+                        for entry in result.review_logs:
+                            self.log.emit(f"[검토] {path}\n{entry}")
                     if result.skipped_line_count and not result.character_count:
                         failed += 1
                         self.file_result.emit(index, "평가 불가", result)
@@ -279,7 +284,8 @@ class EvaluationWorker(QThread):
                         errors += result.error_count
                         if result.skipped_line_count:
                             partial += 1
-                        self.file_result.emit(index, "부분 평가" if result.skipped_line_count else "완료", result)
+                        state = "부분 평가" if result.skipped_line_count else "완료"
+                        self.file_result.emit(index, "검토 필요" if result.review_logs else state, result)
                 except CorrectionCancelled:
                     self.file_result.emit(index, "중단", None)
                     raise
@@ -298,9 +304,10 @@ class EvaluationWorker(QThread):
         finally:
             state = "평가 중단" if self.isInterruptionRequested() else "평가 종료"
             partial_summary = f" (부분 평가 {partial}개)" if partial else ""
+            review_summary = f", 검토 필요 {reviewed}개" if reviewed else ""
             self.summary.emit(
                 f"{state}: 완료 {completed}개{partial_summary}, 오류 {errors}건, 실패 {failed}개, "
-                f"미처리 {len(self.paths) - completed - failed}개"
+                f"미처리 {len(self.paths) - completed - failed}개{review_summary}"
             )
 
 
@@ -505,12 +512,12 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._update_controls)
         self.table.cellDoubleClicked.connect(self.open_subtitle_target)
         splitter.addWidget(self.table)
-        self.evaluation_table = QTableWidget(0, 5)
+        self.evaluation_table = QTableWidget(0, 6)
         self.evaluation_table.setItemDelegate(TableItemDelegate(self.evaluation_table))
         self.evaluation_table.setMouseTracking(True)
         self.evaluation_table.cellDoubleClicked.connect(self.open_evaluation_target)
         self.evaluation_table.setHorizontalHeaderLabels([
-            "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수",
+            "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수", "검토",
         ])
         self.evaluation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -518,6 +525,8 @@ class MainWindow(QMainWindow):
         self.evaluation_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         for column in (3, 4):
             self.evaluation_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.evaluation_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.evaluation_table.setColumnWidth(5, 44)
         self.evaluation_table.horizontalHeaderItem(3).setToolTip(
             "평가 대상 본문의 문자 수: 공백·줄바꿈·서식 태그·줄 시작 대사 표식 제외, 문장부호 포함"
         )
@@ -888,6 +897,9 @@ class MainWindow(QMainWindow):
         if result is None:
             return
         output, logs = result
+        self._show_review_dialog(path, output, logs)
+
+    def _show_review_dialog(self, path: Path, output: str, logs: list[str] | tuple[str, ...]) -> None:
         dialog = QDialog(self)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.setWindowTitle(f"검토 내역 - {path.name}")
@@ -1013,10 +1025,35 @@ class MainWindow(QMainWindow):
     def _evaluation_result(self, row: int, state: str, result: EvaluationResult | None) -> None:
         state_item = QTableWidgetItem(state)
         state_item.setData(Qt.ItemDataRole.UserRole, state)
+        review_logs = result.review_logs if result is not None else ()
+        label = state
+        if review_logs and state != "검토 필요":
+            label += " / 검토 필요"
         if result is not None and result.skipped_line_count:
-            state_item.setText(f"{state} ({result.skipped_line_count}줄 제외)")
-            state_item.setToolTip("\n\n".join(result.warnings))
+            partial_label = "부분 평가, " if state == "검토 필요" else ""
+            label += f" ({partial_label}{result.skipped_line_count}줄 제외)"
+        state_item.setText(label)
+        if result is not None:
+            conversion = (
+                (f"{result.converted_from} -> UTF-8 BOM (원본 교체 완료)",)
+                if result.converted_from else ()
+            )
+            state_item.setToolTip("\n\n".join(conversion + result.warnings + review_logs))
         self.evaluation_table.setItem(row, 1, state_item)
+        review_item = QTableWidgetItem("\n\n".join(review_logs))
+        review_item.setToolTip(review_item.text())
+        self.evaluation_table.setItem(row, 5, review_item)
+        review_button = QToolButton()
+        review_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView))
+        review_button.setToolTip(f"간이평가 검토 내역 ({len(review_logs)}건)")
+        review_button.setAccessibleName("간이평가 검토 내역")
+        path_item = self.evaluation_table.item(row, 0)
+        path_text = path_item.toolTip() if path_item is not None else ""
+        review_button.setEnabled(bool(review_logs and path_text))
+        review_button.clicked.connect(
+            lambda _checked=False, path=path_text, logs=review_logs: self._show_review_dialog(Path(path), path, logs)
+        )
+        self.evaluation_table.setCellWidget(row, 5, review_button)
         if state == "평가 불가":
             result = None
         self.evaluation_table.setItem(row, 2, EvaluationNumberItem(result.error_count if result else None))
@@ -1039,7 +1076,7 @@ class MainWindow(QMainWindow):
                 continue
             rate = rate_item.data(Qt.ItemDataRole.UserRole)
             if (
-                state_item.data(Qt.ItemDataRole.UserRole) in {"완료", "부분 평가"}
+                state_item.data(Qt.ItemDataRole.UserRole) in {"완료", "부분 평가", "검토 필요"}
                 and rate is not None and rate >= threshold and path_item.toolTip()
             ):
                 kept_paths.add(Path(path_item.toolTip()))

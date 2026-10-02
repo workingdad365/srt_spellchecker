@@ -198,8 +198,8 @@ def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, mo
     window.export_button.click()
     with csv_path.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.reader(stream))
-    assert rows[1][1:] == ["부분 평가 (1줄 제외)", "1", "5", "200.00"]
-    assert rows[3][1:] == ["평가 불가 (1줄 제외)", "—", "—", "—"]
+    assert rows[1][1:] == ["부분 평가 (1줄 제외)", "1", "5", "200.00", ""]
+    assert rows[3][1:] == ["평가 불가 (1줄 제외)", "—", "—", "—", ""]
     window.evaluation_threshold_spin.setValue(100)
     window.filter_evaluation_button.click()
     assert window.paths == [paths[0]]
@@ -207,6 +207,75 @@ def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, mo
     window.correction_radio.click()
     assert window.paths == [paths[0]]
     assert [path.read_bytes() for path in paths] == originals
+
+
+@pytest.mark.parametrize("skipped", [0, 1, 2])
+def test_evaluation_encoding_timeline_review_dialog_csv_and_filter(window, app, tmp_path, monkeypatch, skipped):
+    paths = [tmp_path / "normal.srt", tmp_path / "timeline.srt"]
+    paths[0].write_text("1\n00:00:01,000 --> 00:00:02,000\n정상\n", encoding="utf-8")
+    first = "변경" if skipped == 2 else "안녕 하세요"
+    second = "변경" if skipped else "반갑 습니다"
+    source = f"11\n00:00:03,000 --> 00:00:04,000\n{first}\n\n12\n00:00:01,000 --> 00:00:02,000\n{second}\n"
+    paths[1].write_bytes(source.encode("utf-16"))
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            if text != "정상":
+                assert paths[1].read_bytes() == source.encode("utf-8-sig")
+            return text + "!" if text == "변경" else text.replace(" ", "")
+
+    monkeypatch.setattr(gui, "create_spacer", Spacer)
+    window._files_loaded(paths)
+    window._store_review(paths[0], "old_revised.srt", ["기존 LLM 검토 내역"])
+    old_reviews = dict(window.review_results)
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    table.sortItems(0, Qt.SortOrder.DescendingOrder)
+    assert table.item(0, 0).toolTip() == str(paths[1])
+    state = table.item(0, 1).text()
+    assert "검토 필요" in state
+    if skipped:
+        assert f"{skipped}줄 제외" in state
+        assert ("평가 불가" if skipped == 2 else "부분 평가") in state
+    assert table.item(0, 4).text() == ("—" if skipped == 2 else "200.00")
+    assert "UTF-8 BOM (원본 교체 완료)" in table.item(0, 1).toolTip()
+    assert "자막 #12: 시작시간 역행" in table.item(0, 5).text()
+    assert "직전 자막 #11: 00:00:03,000" in table.item(0, 5).toolTip()
+    assert "검토 필요 1개" in window.status_label.text()
+    assert "[인코딩 변환]" in window.log_view.toPlainText()
+    assert "[확인필요] 자막 #12" in window.log_view.toPlainText()
+    table.cellWidget(0, 5).click()
+    dialog = next(dialog for dialog in window.findChildren(QDialog) if dialog.isVisible())
+    assert paths[1].name in dialog.windowTitle()
+    details = dialog.findChild(QPlainTextEdit).toPlainText()
+    assert str(paths[1]) in details and "자막 #12: 시작시간 역행" in details
+    dialog.close()
+    assert not table.cellWidget(1, 5).isEnabled()
+    assert window.review_results == old_reviews
+    assert not window.completed_paths
+    assert [window.table.item(row, 1).text() for row in range(2)] == ["대기", "대기"]
+    csv_path = tmp_path / "timeline.csv"
+    monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(csv_path), "CSV (*.csv)"))
+    window.export_evaluation_csv()
+    with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.reader(stream))
+    assert rows[0][-1] == "검토"
+    assert "자막 #12: 시작시간 역행" in rows[1][-1]
+    window.evaluation_threshold_spin.setValue(100)
+    window.filter_evaluation_results()
+    assert window.paths == ([] if skipped == 2 else [paths[1]])
+    assert paths[1].read_bytes() == source.encode("utf-8-sig")
+    if skipped != 2:
+        assert table.cellWidget(0, 5).isEnabled()
+        source = source.replace("00:00:03,000", "00:00:00,000")
+        paths[1].write_bytes(source.encode("utf-8-sig"))
+        window.start_evaluation()
+        finish_work(window, app)
+        assert "검토 필요" not in table.item(0, 1).text()
+        assert not table.cellWidget(0, 5).isEnabled()
+        assert table.item(0, 5).text() == ""
 
 
 @pytest.mark.parametrize(("threshold", "kept_indices"), [
@@ -377,11 +446,11 @@ def test_export_csv_preserves_table_order_headers_and_values(window, tmp_path, m
     with path.open(encoding="utf-8-sig", newline="") as file:
         rows = list(csv.reader(file))
     assert rows == [
-        ["평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수"],
-        ["빈도 높은 자막.srt", "완료", "2", "100", "20.00"],
-        ['기린의 날개 (2012)\\한글,"자막".srt', "완료", "10", "10000", "1.00"],
-        ["실패.srt", "실패", "—", "—", "—"],
-        ["중단.srt", "중단", "—", "—", "—"],
+        ["평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수", "검토"],
+        ["빈도 높은 자막.srt", "완료", "2", "100", "20.00", ""],
+        ['기린의 날개 (2012)\\한글,"자막".srt', "완료", "10", "10000", "1.00", ""],
+        ["실패.srt", "실패", "—", "—", "—", ""],
+        ["중단.srt", "중단", "—", "—", "—", ""],
     ]
     assert "CSV 저장 완료" in window.status_label.text()
     window.clear_files()
