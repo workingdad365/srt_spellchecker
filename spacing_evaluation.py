@@ -130,7 +130,7 @@ def evaluate_file(
         content = path.read_bytes().decode("utf-8-sig")
         blocks = [block for block in parse_srt_blocks(content) if block.is_subtitle]
     lines = [
-        (block.sequence, line_number, line)
+        ((block.sequence or "").strip(), line_number, line)
         for block in blocks
         for line_number, line in enumerate(block.text_lines, start=1)
     ]
@@ -160,6 +160,12 @@ def evaluate_file(
             on_progress(index + 1, len(lines))
     check_cancelled(is_cancelled)
     review_logs: list[str] = []
+    first_sequence = (blocks[0].sequence or "").strip()
+    if not content.startswith("1 "):
+        review_logs.append(
+            f'[확인필요] 자막 #{first_sequence}: 파일 시작이 "1 "이 아님\n'
+            f"  파일 시작: {json.dumps(content[:40], ensure_ascii=False)}"
+        )
     previous_start: tuple[str, int, str] | None = None
     for block in blocks:
         check_cancelled(is_cancelled)
@@ -175,7 +181,7 @@ def evaluate_file(
                 )
         match = re.match(r"\s*(\d+):([0-5]\d):([0-5]\d)[,.](\d{3})\s*-->", block.timecode or "")
         if match is None:
-            review_logs.append(f"[확인필요] 자막 #{block.sequence}: 시작시간 형식 확인 필요\n  {block.timecode}")
+            review_logs.append(f"[확인필요] 자막 #{sequence}: 시작시간 형식 확인 필요\n  {block.timecode}")
             previous_start = None
             continue
         hours, minutes, seconds, milliseconds = map(int, match.groups())
@@ -188,4 +194,20 @@ def evaluate_file(
                 f"  현재 자막 #{sequence}: {timestamp}"
             )
         previous_start = (sequence, start, timestamp)
+        end_match = re.match(
+            r"\s*(\d+):([0-5]\d):([0-5]\d)[,.](\d{3})(?=\s|$)",
+            (block.timecode or "")[match.end():],
+        )
+        if end_match is None:
+            review_logs.append(f"[확인필요] 자막 #{sequence}: 종료시간 형식 확인 필요\n  {block.timecode}")
+            continue
+        end_hours, end_minutes, end_seconds, end_milliseconds = map(int, end_match.groups())
+        end = ((end_hours * 60 + end_minutes) * 60 + end_seconds) * 1000 + end_milliseconds
+        if end <= start:
+            end_timestamp = f"{end_hours:02}:{end_minutes:02}:{end_seconds:02},{end_milliseconds:03}"
+            review_logs.append(
+                f"[확인필요] 자막 #{sequence}: 종료시간이 시작시간보다 같거나 빠름\n"
+                f"  시작시간: {timestamp}\n"
+                f"  종료시간: {end_timestamp}"
+            )
     return EvaluationResult(count, character_count, tuple(warnings), converted_from, tuple(review_logs))

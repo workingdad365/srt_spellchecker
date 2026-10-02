@@ -168,7 +168,7 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
 def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, monkeypatch):
     paths = [tmp_path / name for name in ("partial.srt", "unscorable.srt", "normal.srt")]
     for path, body in zip(paths, ["오류\n반갑 습니다", "오류", "안녕하세요"]):
-        path.write_text("388\n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8")
+        path.write_text("1 \n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8")
     originals = [path.read_bytes() for path in paths]
 
     class Spacer:
@@ -184,14 +184,14 @@ def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, mo
     table.sortItems(4, Qt.SortOrder.DescendingOrder)
     assert [table.item(row, 0).toolTip() for row in range(3)] == [str(paths[index]) for index in (0, 2, 1)]
     assert table.item(0, 1).text() == "부분 평가 (1줄 제외)"
-    assert "자막 #388, 본문 1줄" in table.item(0, 1).toolTip()
+    assert "자막 #1, 본문 1줄" in table.item(0, 1).toolTip()
     assert [table.item(0, column).text() for column in (2, 3, 4)] == ["1", "5", "200.00"]
     assert table.item(1, 1).text() == "완료"
     assert table.item(2, 1).text() == "평가 불가 (1줄 제외)"
     assert [table.item(2, column).text() for column in (2, 3, 4)] == ["—", "—", "—"]
     assert "완료 2개 (부분 평가 1개), 오류 1건, 실패 1개, 미처리 0개" in window.status_label.text()
     assert window.progress_bar.value() == 1000
-    assert f"[제외] {paths[0]}: 자막 #388" in window.log_view.toPlainText()
+    assert f"[제외] {paths[0]}: 자막 #1" in window.log_view.toPlainText()
     assert 'Kiwi 결과: "오류!"' in window.log_view.toPlainText()
     csv_path = tmp_path / "partial.csv"
     monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(csv_path), "CSV (*.csv)"))
@@ -209,10 +209,17 @@ def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, mo
     assert [path.read_bytes() for path in paths] == originals
 
 
-@pytest.mark.parametrize("marker", ["krCc", "eGcC", "&nbsp;"])
-def test_evaluation_review_markers_gui(window, app, tmp_path, monkeypatch, marker):
+@pytest.mark.parametrize(("marker", "timecode", "review_location", "reason"), [
+    ("31", "00:00:01,000 --> 00:00:02,000", "자막 #31", '파일 시작이 "1 "이 아님'),
+    ("krCc", "00:00:01,000 --> 00:00:02,000", "자막 #31, 본문 1줄", "문자열 발견"),
+    ("eGcC", "00:00:01,000 --> 00:00:02,000", "자막 #31, 본문 1줄", "문자열 발견"),
+    ("&nbsp;", "00:00:01,000 --> 00:00:02,000", "자막 #31, 본문 1줄", "문자열 발견"),
+    ("01:20:09,818", "01:20:09,818 --> 01:20:09,818", "자막 #31", "종료시간이 시작시간보다 같거나 빠름"),
+    ("01:20:09,817", "01:20:09,818 --> 01:20:09,817", "자막 #31", "종료시간이 시작시간보다 같거나 빠름"),
+])
+def test_evaluation_review_reasons_gui(window, app, tmp_path, monkeypatch, marker, timecode, review_location, reason):
     path = tmp_path / "markers.srt"
-    content = f"31\n00:00:01,000 --> 00:00:02,000\n{marker}\n"
+    content = f"31\n{timecode}\n{marker}\n"
     path.write_bytes(content.encode("utf-8"))
 
     class Spacer:
@@ -227,14 +234,14 @@ def test_evaluation_review_markers_gui(window, app, tmp_path, monkeypatch, marke
     table = window.evaluation_table
     assert table.item(0, 1).text() == "검토 필요"
     assert table.item(0, 2).text() == "0"
-    assert "자막 #31, 본문 1줄" in table.item(0, 1).toolTip()
+    assert review_location in table.item(0, 1).toolTip()
     assert marker in table.item(0, 5).text()
-    assert "문자열 발견" in window.log_view.toPlainText()
+    assert reason in window.log_view.toPlainText()
     assert table.cellWidget(0, 5).isEnabled()
     table.cellWidget(0, 5).click()
     dialog = next(dialog for dialog in window.findChildren(QDialog) if dialog.isVisible())
     details = dialog.findChild(QPlainTextEdit).toPlainText()
-    assert "자막 #31, 본문 1줄" in details and marker in details
+    assert review_location in details and marker in details and reason in details
     dialog.close()
     csv_path = tmp_path / "markers.csv"
     monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(csv_path), "CSV (*.csv)"))
@@ -242,17 +249,17 @@ def test_evaluation_review_markers_gui(window, app, tmp_path, monkeypatch, marke
     with csv_path.open(encoding="utf-8-sig", newline="") as stream:
         rows = list(csv.reader(stream))
     assert rows[1][1] == "검토 필요"
-    assert "자막 #31, 본문 1줄" in rows[1][-1] and marker in rows[1][-1]
+    assert review_location in rows[1][-1] and marker in rows[1][-1] and reason in rows[1][-1]
     assert path.read_bytes() == content.encode("utf-8")
 
 
 @pytest.mark.parametrize("skipped", [0, 1, 2])
 def test_evaluation_encoding_timeline_review_dialog_csv_and_filter(window, app, tmp_path, monkeypatch, skipped):
     paths = [tmp_path / "normal.srt", tmp_path / "timeline.srt"]
-    paths[0].write_text("1\n00:00:01,000 --> 00:00:02,000\n정상\n", encoding="utf-8")
+    paths[0].write_text("1 \n00:00:01,000 --> 00:00:02,000\n정상\n", encoding="utf-8")
     first = "변경" if skipped == 2 else "안녕 하세요"
     second = "변경" if skipped else "반갑 습니다"
-    source = f"11\n00:00:03,000 --> 00:00:04,000\n{first}\n\n12\n00:00:01,000 --> 00:00:02,000\n{second}\n"
+    source = f"1 \n00:00:03,000 --> 00:00:04,000\n{first}\n\n12\n00:00:01,000 --> 00:00:02,000\n{second}\n"
     paths[1].write_bytes(source.encode("utf-16"))
 
     class Spacer:
@@ -279,7 +286,7 @@ def test_evaluation_encoding_timeline_review_dialog_csv_and_filter(window, app, 
     assert table.item(0, 4).text() == ("—" if skipped == 2 else "200.00")
     assert "UTF-8 BOM (원본 교체 완료)" in table.item(0, 1).toolTip()
     assert "자막 #12: 시작시간 역행" in table.item(0, 5).text()
-    assert "직전 자막 #11: 00:00:03,000" in table.item(0, 5).toolTip()
+    assert "직전 자막 #1: 00:00:03,000" in table.item(0, 5).toolTip()
     assert "검토 필요 1개" in window.status_label.text()
     assert "[인코딩 변환]" in window.log_view.toPlainText()
     assert "[확인필요] 자막 #12" in window.log_view.toPlainText()
