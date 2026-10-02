@@ -161,9 +161,9 @@ def evaluate_file(
     check_cancelled(is_cancelled)
     review_logs: list[str] = []
     first_sequence = (blocks[0].sequence or "").strip()
-    if not content.startswith("1 "):
+    if not content.startswith("1\r\n"):
         review_logs.append(
-            f'[확인필요] 자막 #{first_sequence}: 파일 시작이 "1 "이 아님\n'
+            f'[확인필요] 자막 #{first_sequence}: 파일 시작이 "1\\r\\n"이 아님\n'
             f"  파일 시작: {json.dumps(content[:40], ensure_ascii=False)}"
         )
     previous_start: tuple[str, int, str] | None = None

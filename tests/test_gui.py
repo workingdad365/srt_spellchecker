@@ -168,7 +168,7 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
 def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, monkeypatch):
     paths = [tmp_path / name for name in ("partial.srt", "unscorable.srt", "normal.srt")]
     for path, body in zip(paths, ["오류\n반갑 습니다", "오류", "안녕하세요"]):
-        path.write_text("1 \n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8")
+        path.write_text("1\r\n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8", newline="")
     originals = [path.read_bytes() for path in paths]
 
     class Spacer:
@@ -210,7 +210,7 @@ def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, mo
 
 
 @pytest.mark.parametrize(("marker", "timecode", "review_location", "reason"), [
-    ("31", "00:00:01,000 --> 00:00:02,000", "자막 #31", '파일 시작이 "1 "이 아님'),
+    ("31", "00:00:01,000 --> 00:00:02,000", "자막 #31", '파일 시작이 "1\\r\\n"이 아님'),
     ("krCc", "00:00:01,000 --> 00:00:02,000", "자막 #31, 본문 1줄", "문자열 발견"),
     ("eGcC", "00:00:01,000 --> 00:00:02,000", "자막 #31, 본문 1줄", "문자열 발견"),
     ("&nbsp;", "00:00:01,000 --> 00:00:02,000", "자막 #31, 본문 1줄", "문자열 발견"),
@@ -256,10 +256,10 @@ def test_evaluation_review_reasons_gui(window, app, tmp_path, monkeypatch, marke
 @pytest.mark.parametrize("skipped", [0, 1, 2])
 def test_evaluation_encoding_timeline_review_dialog_csv_and_filter(window, app, tmp_path, monkeypatch, skipped):
     paths = [tmp_path / "normal.srt", tmp_path / "timeline.srt"]
-    paths[0].write_text("1 \n00:00:01,000 --> 00:00:02,000\n정상\n", encoding="utf-8")
+    paths[0].write_text("1\r\n00:00:01,000 --> 00:00:02,000\n정상\n", encoding="utf-8", newline="")
     first = "변경" if skipped == 2 else "안녕 하세요"
     second = "변경" if skipped else "반갑 습니다"
-    source = f"1 \n00:00:03,000 --> 00:00:04,000\n{first}\n\n12\n00:00:01,000 --> 00:00:02,000\n{second}\n"
+    source = f"1\r\n00:00:03,000 --> 00:00:04,000\n{first}\n\n12\n00:00:01,000 --> 00:00:02,000\n{second}\n"
     paths[1].write_bytes(source.encode("utf-16"))
 
     class Spacer:

@@ -26,7 +26,7 @@ def test_non_whitespace_changes_are_not_counted():
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
 def test_evaluate_only_subtitle_text_without_writing(tmp_path, encoding):
     path = tmp_path / "sample.srt"
-    source = '1 \r\n00:00:01,000 --> 00:00:02,000\r\n<i>안녕 하세요</i>\r\n/ 반갑 습니다\r\n\r\n메모 블록\r\n'
+    source = '1\r\n00:00:01,000 --> 00:00:02,000\r\n<i>안녕 하세요</i>\r\n/ 반갑 습니다\r\n\r\n메모 블록\r\n'
     path.write_bytes(source.encode(encoding))
     before = path.read_bytes()
     calls = []
@@ -152,12 +152,12 @@ def test_undecodable_or_invalid_source_is_not_replaced(tmp_path, raw):
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16"])
 @pytest.mark.parametrize(("prefix", "invalid"), [
-    ("1 ", False), ("1 \r", False),
+    ("1\r", False), ("1 ", True), ("1 \r", True),
     ("1", True), ("01", True), ("01 ", True), (" 1 ", True),
     ("0 ", True), ("2 ", True), ("100 ", True), ("1\t", True), ("1\u00a0", True),
     ("\n1 ", True), ("메모\n\n1 ", True),
 ])
-def test_file_must_start_with_literal_one_and_space(tmp_path, prefix, invalid, encoding):
+def test_file_must_start_with_literal_one_and_crlf(tmp_path, prefix, invalid, encoding):
     path = tmp_path / "number.srt"
     source = (
         f"{prefix}\n00:00:01,000 --> 00:00:02,000\n본문\n\n"
@@ -173,7 +173,7 @@ def test_file_must_start_with_literal_one_and_space(tmp_path, prefix, invalid, e
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == int(invalid)
     if invalid:
-        assert '파일 시작이 "1 "이 아님' in result.review_logs[0]
+        assert '파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
         assert "파일 시작:" in result.review_logs[0]
     assert path.read_bytes() == source.encode("utf-8-sig" if encoding == "utf-16" else encoding)
 
@@ -201,7 +201,7 @@ def test_timeline_review_records_every_immediate_start_regression(tmp_path, enco
     assert len(calls) == 6
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == 3
-    assert '자막 #9: 파일 시작이 "1 "이 아님' in result.review_logs[0]
+    assert '자막 #9: 파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
     assert "자막 #12: 시작시간 역행" in result.review_logs[1]
     assert "직전 자막 #11: 01:00:00,001" in result.review_logs[1]
     assert "현재 자막 #12: 01:00:00,000" in result.review_logs[1]
@@ -212,9 +212,8 @@ def test_timeline_review_records_every_immediate_start_regression(tmp_path, enco
 def test_timeline_review_remains_available_when_all_spacing_lines_are_skipped(tmp_path):
     path = tmp_path / "skipped.srt"
     path.write_text(
-        "1 \n00:00:02,000 --> 00:00:03,000\n본문\n\n"
-        "2\n00:00:01,000 --> 00:00:02,000\n본문\n", encoding="utf-8",
-    )
+        "1\r\n00:00:02,000 --> 00:00:03,000\n본문\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\n본문\n", encoding="utf-8", newline="")
 
     class Spacer:
         def space(self, text, **_kwargs):
@@ -252,7 +251,7 @@ def test_end_time_must_be_strictly_after_start(tmp_path, start, end, invalid):
     result = evaluate_file(path, Spacer())
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == 1 + int(invalid)
-    assert '자막 #42: 파일 시작이 "1 "이 아님' in result.review_logs[0]
+    assert '자막 #42: 파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
     if invalid:
         assert "자막 #42: 종료시간이 시작시간보다 같거나 빠름" in result.review_logs[1]
         assert f"시작시간: {start.replace('.', ',')}" in result.review_logs[1]
@@ -264,9 +263,8 @@ def test_end_time_must_be_strictly_after_start(tmp_path, start, end, invalid):
 def test_invalid_end_time_does_not_disable_start_regression_check(tmp_path, end):
     path = tmp_path / "malformed_end.srt"
     path.write_text(
-        f"1 \n00:00:03,000 --> {end}\n본문\n\n"
-        "2\n00:00:02,000 --> 00:00:01,000\n본문\n", encoding="utf-8",
-    )
+        f"1\r\n00:00:03,000 --> {end}\n본문\n\n"
+        "2\n00:00:02,000 --> 00:00:01,000\n본문\n", encoding="utf-8", newline="")
 
     class Spacer:
         def space(self, text, **_kwargs):
@@ -282,7 +280,7 @@ def test_invalid_end_time_does_not_disable_start_regression_check(tmp_path, end)
 
 def test_malformed_start_time_is_reported_for_manual_review(tmp_path):
     path = tmp_path / "malformed.srt"
-    path.write_text("1 \n잘못된 시간 --> 00:00:03,000\n본문\n", encoding="utf-8")
+    path.write_text("1\r\n잘못된 시간 --> 00:00:03,000\n본문\n", encoding="utf-8", newline="")
 
     class Spacer:
         def space(self, text, **_kwargs):
@@ -311,7 +309,7 @@ def test_review_markers_are_detected_without_changing_source(tmp_path, body, mar
     result = evaluate_file(path, Spacer())
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == 1 + bool(markers)
-    assert '자막 #15: 파일 시작이 "1 "이 아님' in result.review_logs[0]
+    assert '자막 #15: 파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
     if markers:
         assert "자막 #15, 본문 2줄" in result.review_logs[1]
         assert f"문자열 발견 ({', '.join(markers)})" in result.review_logs[1]
@@ -322,10 +320,9 @@ def test_review_markers_are_detected_without_changing_source(tmp_path, body, mar
 def test_marker_review_coexists_with_skipped_lines_and_timeline_review(tmp_path):
     path = tmp_path / "combined.srt"
     path.write_text(
-        "1 \n00:00:03,000 --> 00:00:04,000\nkrcc\n\n"
+        "1\r\n00:00:03,000 --> 00:00:04,000\nkrcc\n\n"
         "2\n00:00:01,000 --> 00:00:02,000\negcc\n&nbsp;\n\n"
-        "3\n잘못된 시간 --> 00:00:05,000\nKRCC\n", encoding="utf-8",
-    )
+        "3\n잘못된 시간 --> 00:00:05,000\nKRCC\n", encoding="utf-8", newline="")
 
     class Spacer:
         def space(self, text, **_kwargs):
@@ -436,11 +433,11 @@ def test_invalid_subtitle_is_failure(tmp_path):
 
 def test_real_kiwi_spacing(tmp_path):
     path = tmp_path / "real.srt"
-    path.write_text("1 \n00:00:01,000 --> 00:00:02,000\n안녕하세요\n", encoding="utf-8")
+    path.write_text("1\r\n00:00:01,000 --> 00:00:02,000\n안녕하세요\n", encoding="utf-8", newline="")
     spacer = create_spacer()
     assert evaluate_file(path, spacer) == EvaluationResult(error_count=0, character_count=5)
     assert spacing_error_count("안녕 하세요", spacer.space("안녕 하세요", reset_whitespace=True)) == 1
-    path.write_text("1 \n00:00:01,000 --> 00:00:02,000\n\ufeff안녕하세요\n", encoding="utf-8-sig")
+    path.write_text("1\r\n00:00:01,000 --> 00:00:02,000\n\ufeff안녕하세요\n", encoding="utf-8-sig", newline="")
     assert evaluate_file(path, spacer) == EvaluationResult(error_count=0, character_count=5)
 
 
@@ -450,7 +447,7 @@ def test_real_kiwi_spacing(tmp_path):
 ])
 def test_embedded_bom_is_excluded_without_modifying_file(tmp_path, body):
     path = tmp_path / "embedded_bom.srt"
-    path.write_text("1 \n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8-sig")
+    path.write_text("1\r\n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8-sig", newline="")
     before = path.read_bytes()
 
     class Spacer:
@@ -476,7 +473,7 @@ def test_error_frequency(errors, characters, expected):
 ])
 def test_character_count_uses_analyzed_text(tmp_path, body, characters):
     path = tmp_path / "characters.srt"
-    path.write_text("1 \n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8")
+    path.write_text("1\r\n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8", newline="")
 
     class Spacer:
         def space(self, text, **kwargs):
