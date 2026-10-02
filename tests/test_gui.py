@@ -873,6 +873,159 @@ def test_gui_correction_flow(window, app, tmp_path, monkeypatch) -> None:
     assert window.worker is None
 
 
+@pytest.mark.parametrize("llm_review", [False, True])
+def test_correction_merges_evaluation_reviews_and_restores_them(window, app, tmp_path, monkeypatch, llm_review):
+    paths = [tmp_path / folder / "subtitle.srt" for folder in ("review", "normal")]
+    source = (
+        "1\n00:00:01,000 --> 00:00:02,000\n안녕하세요\n\n"
+        "41\n39:03:20,785 --> 00:05:43,587\n안녕하세요\n\n"
+        "42\n00:05:46,250 --> 00:05:47,000\n안녕하세요\n\n"
+        "186\n18:56:09,663 --> 00:17:18,831\n안녕하세요\n\n"
+        "187\n00:17:29,529 --> 00:17:30,000\n안녕하세요\n"
+    )
+    for path, content in zip(paths, (source, SAMPLE)):
+        path.parent.mkdir()
+        path.write_bytes(content.encode("utf-8"))
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            return text
+
+    def respond(payload):
+        response = echo(payload)
+        if llm_review and len(payload) == 5:
+            response["parsed"].items[0].corrected_lines = []
+        return response
+
+    class Service(EchoService):
+        def __init__(self, *args):
+            FakeCorrector.__init__(self, respond)
+
+    monkeypatch.setattr(gui, "create_spacer", Spacer)
+    monkeypatch.setattr(gui, "ServiceCorrector", Service)
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    evaluation_logs = list(window.evaluation_reviews[paths[0]])
+    assert len(evaluation_logs) == 4
+    assert not window.review_results
+    window.evaluation_table.sortItems(0, Qt.SortOrder.AscendingOrder)
+    window.evaluation_threshold_spin.setValue(0)
+    window.filter_evaluation_results()
+    window.correction_radio.click()
+    prepare_model(window)
+    window.concurrency_spin.setValue(2)
+    window.start_correction()
+    finish_work(window, app)
+
+    output, logs = window.review_results[paths[0]]
+    assert logs[:4] == evaluation_logs
+    assert len(logs) == 4 + int(llm_review)
+    if llm_review:
+        assert "빈 교정 결과" in logs[-1]
+    assert Path(output) == paths[0].with_stem("subtitle_revised")
+    assert Path(output).read_text(encoding="utf-8") == source
+    assert window.table.item(0, 1).text() == "검토 필요"
+    assert window.table.cellWidget(0, 3).isEnabled()
+    assert window.table.item(1, 1).text() == "완료"
+    assert not window.table.cellWidget(1, 3).isEnabled()
+    assert paths[1] not in window.review_results
+    assert "저장 2개 (검토 1개)" in window.status_label.text()
+    window.table.cellWidget(0, 3).click()
+    dialog = next(dialog for dialog in window.findChildren(QDialog) if dialog.isVisible())
+    details = dialog.findChild(QPlainTextEdit).toPlainText()
+    assert f"결과: {output}" in details
+    assert f"검토 {len(logs)}건" in details
+    assert all(details.count(entry) == 1 for entry in logs)
+    dialog.close()
+
+    restored = gui.MainWindow()
+    try:
+        assert restored.review_results[paths[0]] == (output, logs)
+        assert restored.table.item(0, 1).text() == "검토 필요"
+        assert restored.table.cellWidget(0, 3).isEnabled()
+        assert set(paths) == restored.completed_paths
+    finally:
+        restored.close()
+        restored.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("first_result", ["failure", "cancel", "reevaluate"])
+def test_evaluation_reviews_survive_retry_and_use_latest_evaluation(window, app, tmp_path, monkeypatch, first_result):
+    path = tmp_path / "retry.srt"
+    logs = ("[확인필요] 자막 #41: 시작시간 역행",)
+    result = gui.EvaluationResult(0, 0, warnings=("평가에서 제외",), review_logs=logs)
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    window._files_loaded([path])
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    assert "평가 불가" in window.evaluation_table.item(0, 1).text()
+
+    def fail(*_args, **_kwargs):
+        if first_result == "cancel":
+            raise gui.CorrectionCancelled()
+        raise OSError("저장 실패")
+
+    if first_result == "reevaluate":
+        result = gui.EvaluationResult(0, 5)
+        window.start_evaluation()
+        finish_work(window, app)
+    else:
+        monkeypatch.setattr(gui, "correct_file", fail)
+        window.correction_radio.click()
+        prepare_model(window)
+        window.start_correction()
+        finish_work(window, app)
+        assert window.table.item(0, 1).text() == ("실패" if first_result == "failure" else "중단")
+        assert not window.table.cellWidget(0, 3).isEnabled()
+        assert window.evaluation_reviews[path] == logs
+
+    monkeypatch.setattr(gui, "correct_file", lambda *_args, **_kwargs: (
+        path.with_stem("retry_revised"), [] if first_result == "reevaluate" else list(logs),
+    ))
+    window.correction_radio.click()
+    prepare_model(window)
+    window.start_correction()
+    finish_work(window, app)
+    if first_result == "reevaluate":
+        assert window.table.item(0, 1).text() == "완료"
+        assert path not in window.review_results
+    else:
+        assert window.table.item(0, 1).text() == "검토 필요"
+        assert window.review_results[path][1] == list(logs)
+
+
+@pytest.mark.parametrize("remove", ["clear", "waiting", "selected", "filter"])
+def test_removing_files_discards_evaluation_reviews(window, app, tmp_path, monkeypatch, remove):
+    path = tmp_path / "removed.srt"
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda *_args, **_kwargs: gui.EvaluationResult(
+        0, 5, review_logs=("[확인필요] 자막 #41: 시작시간 역행",),
+    ))
+    window._files_loaded([path])
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    assert path in window.evaluation_reviews
+    if remove == "clear":
+        window.clear_files()
+    elif remove == "waiting":
+        window.remove_waiting_file(path)
+    elif remove == "selected":
+        window.table.selectRow(0)
+        window.remove_selected()
+    else:
+        window.evaluation_threshold_spin.setValue(1)
+        window.filter_evaluation_results()
+    assert not window.paths
+    assert not window.evaluation_reviews
+
+
 @pytest.mark.parametrize(("batch_size", "expected_sizes"), [
     (1, [1] * 27), (10, [10, 10, 7]), (25, [25, 2]), (200, [27]),
 ])

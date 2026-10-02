@@ -325,6 +325,7 @@ class MainWindow(QMainWindow):
         self.paths: list[Path] = []
         self.completed_paths: set[Path] = set()
         self.review_results: dict[Path, tuple[str, list[str]]] = {}
+        self.evaluation_reviews: dict[Path, tuple[str, ...]] = {}
         self.worker: QThread | None = None
         self.correction_workers: dict[Path, CorrectionWorker] = {}
         self._file_progress: dict[Path, int] = {}
@@ -927,6 +928,7 @@ class MainWindow(QMainWindow):
             self._session_paths.remove(path)
         self._attempted_paths.discard(path)
         self.review_results.pop(path, None)
+        self.evaluation_reviews.pop(path, None)
         if self._correction_active:
             self._update_progress()
         self.log_view.appendPlainText(f"[대기열] 제거: {path}")
@@ -939,6 +941,7 @@ class MainWindow(QMainWindow):
         rows = sorted({item.row() for item in self.table.selectedItems()}, reverse=True)
         for row in rows:
             self.review_results.pop(self.paths[row], None)
+            self.evaluation_reviews.pop(self.paths[row], None)
             del self.paths[row]
             self.table.removeRow(row)
         self._update_controls()
@@ -949,6 +952,7 @@ class MainWindow(QMainWindow):
             self.paths.clear()
             self.table.setRowCount(0)
             self.review_results.clear()
+            self.evaluation_reviews.clear()
             self.evaluation_table.setRowCount(0)
             self.progress_bar.setValue(0)
             self._update_controls()
@@ -1005,6 +1009,7 @@ class MainWindow(QMainWindow):
     def start_evaluation(self) -> None:
         if self.worker is not None or self.file_loader is not None or self._correction_active or self.correction_workers or not self.paths:
             return
+        self.evaluation_reviews.clear()
         self.evaluation_table.setSortingEnabled(False)
         self.evaluation_table.setRowCount(0)
         for row, path in enumerate(self.paths):
@@ -1049,6 +1054,8 @@ class MainWindow(QMainWindow):
         review_button.setAccessibleName("간이평가 검토 내역")
         path_item = self.evaluation_table.item(row, 0)
         path_text = path_item.toolTip() if path_item is not None else ""
+        if review_logs and path_text:
+            self.evaluation_reviews[Path(path_text)] = review_logs
         review_button.setEnabled(bool(review_logs and path_text))
         review_button.clicked.connect(
             lambda _checked=False, path=path_text, logs=review_logs: self._show_review_dialog(Path(path), path, logs)
@@ -1086,6 +1093,7 @@ class MainWindow(QMainWindow):
             path = self.paths[row]
             if path not in kept_paths:
                 self.review_results.pop(path, None)
+                self.evaluation_reviews.pop(path, None)
                 self._attempted_paths.discard(path)
                 self._file_progress.pop(path, None)
                 del self.paths[row]
@@ -1222,6 +1230,15 @@ class MainWindow(QMainWindow):
         )
 
     def _file_state(self, row: int, state: str, output: str) -> None:
+        path = self.paths[row]
+        if state in {"완료", "검토 필요"}:
+            logs = list(dict.fromkeys([
+                *self.evaluation_reviews.get(path, ()),
+                *self.review_results.get(path, ("", []))[1],
+            ]))
+            if logs:
+                self._store_review(path, output, logs)
+                state = "검토 필요"
         self.table.item(row, 1).setText(state)
         output_path = Path(output)
         self.table.item(row, 2).setText(str(Path(output_path.parent.name) / output_path.name) if output else "")
