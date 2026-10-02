@@ -12,9 +12,12 @@ import httpx
 import openai
 import pytest
 import shiboken6
-from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QPoint, QPointF, QSettings, QTimer, Qt, QUrl
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPalette
-from PySide6.QtWidgets import QApplication, QDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit
+from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QPoint, QPointF, QRect, QSettings, QTimer, Qt, QUrl
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QImage, QPainter, QPalette
+from PySide6.QtWidgets import (
+    QApplication, QDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QStyleOptionViewItem, QTableWidgetItem,
+)
 
 import srt_spellchecker_gui as gui
 import app_settings
@@ -490,6 +493,49 @@ def test_active_row_background_is_rendered(window, app, tmp_path, active_row) ->
     rect = window.table.visualItemRect(item)
     rendered = image.pixelColor(int((rect.right() - 10) * scale), int((rect.bottom() - 6) * scale))
     assert rendered == item.background().color()
+
+
+@pytest.mark.parametrize("table_name", ["table", "evaluation_table"])
+@pytest.mark.parametrize("dark", [False, True])
+@pytest.mark.parametrize("row", [0, 1])
+def test_table_hover_differs_from_selection_and_preserves_active_background(window, table_name, dark, row):
+    table = getattr(window, table_name)
+    palette = table.palette()
+    palette.setColor(QPalette.ColorRole.Base, QColor("#202020" if dark else "#ffffff"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#d76098"))
+    table.setPalette(palette)
+    table.setRowCount(2)
+    item = QTableWidgetItem("자막")
+    table.setItem(row, 0, item)
+    index = table.model().index(row, 0)
+    flags = gui.QStyle.StateFlag
+
+    def rendered_background(state):
+        option = QStyleOptionViewItem()
+        option.initFrom(table)
+        option.widget = table
+        option.rect = QRect(0, 0, 200, 32)
+        option.state = flags.State_Enabled | flags.State_Active | state
+        if row:
+            option.features |= QStyleOptionViewItem.ViewItemFeature.Alternate
+        image = QImage(200, 32, QImage.Format.Format_ARGB32)
+        image.fill(palette.base().color())
+        painter = QPainter(image)
+        try:
+            table.itemDelegate().paint(painter, option, index)
+        finally:
+            painter.end()
+        return image.pixelColor(185, 25)
+
+    hovered = rendered_background(flags.State_MouseOver)
+    selected = rendered_background(flags.State_Selected)
+    assert hovered == QColor("#353535" if dark else "#eeeeee")
+    assert hovered != selected
+    assert rendered_background(flags.State_Selected | flags.State_MouseOver) == selected
+    active_background = QColor("#214b3a" if dark else "#d9f2e7")
+    item.setBackground(active_background)
+    assert rendered_background(flags.State_MouseOver) == active_background
+    assert rendered_background(flags.State_Selected | flags.State_MouseOver) == rendered_background(flags.State_Selected)
 
 
 def test_default_state_and_model_selection(window) -> None:

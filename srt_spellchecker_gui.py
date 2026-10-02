@@ -7,13 +7,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QIODevice, QMimeData, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QIODevice, QMimeData, QModelIndex, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QBrush, QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QDoubleSpinBox,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
-    QSizePolicy, QSpinBox, QSplitter, QStyle, QTableWidget, QTableWidgetItem, QToolButton,
+    QSizePolicy, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+    QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget,
 )
 
@@ -29,11 +30,26 @@ from srt_spellchecker import (
 __version__ = "1.1.6"
 
 
+class TableItemDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option: QStyleOptionViewItem, index: QModelIndex) -> None:
+        super().initStyleOption(option, index)
+        if option.state & QStyle.StateFlag.State_MouseOver:
+            option.state &= ~QStyle.StateFlag.State_MouseOver
+            if (
+                not option.state & QStyle.StateFlag.State_Selected
+                and option.backgroundBrush.style() == Qt.BrushStyle.NoBrush
+            ):
+                dark = option.palette.base().color().lightness() < 128
+                option.backgroundBrush = QBrush(QColor("#353535" if dark else "#eeeeee"))
+
+
 class FileTable(QTableWidget):
     paths_dropped = Signal(list)
 
     def __init__(self) -> None:
         super().__init__(0, 5)
+        self.setItemDelegate(TableItemDelegate(self))
+        self.setMouseTracking(True)
         self.setHorizontalHeaderLabels(["원본 자막", "상태", "결과 파일", "검토", "제거"])
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
@@ -490,6 +506,8 @@ class MainWindow(QMainWindow):
         self.table.cellDoubleClicked.connect(self.open_subtitle_target)
         splitter.addWidget(self.table)
         self.evaluation_table = QTableWidget(0, 5)
+        self.evaluation_table.setItemDelegate(TableItemDelegate(self.evaluation_table))
+        self.evaluation_table.setMouseTracking(True)
         self.evaluation_table.cellDoubleClicked.connect(self.open_evaluation_target)
         self.evaluation_table.setHorizontalHeaderLabels([
             "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수",
