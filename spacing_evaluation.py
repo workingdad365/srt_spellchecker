@@ -163,6 +163,16 @@ def evaluate_file(
     previous_start: tuple[str, int, str] | None = None
     for block in blocks:
         check_cancelled(is_cancelled)
+        sequence = (block.sequence or "").strip()
+        for line_number, line in enumerate(block.text_lines, start=1):
+            check_cancelled(is_cancelled)
+            folded = line.casefold()
+            markers = [marker for marker in ("KRCC", "EGCC", "&nbsp") if marker.casefold() in folded]
+            if markers:
+                review_logs.append(
+                    f"[확인필요] 자막 #{sequence}, 본문 {line_number}줄: 검토 대상 문자열 발견 ({', '.join(markers)})\n"
+                    f"  원문: {json.dumps(line, ensure_ascii=False)}"
+                )
         match = re.match(r"\s*(\d+):([0-5]\d):([0-5]\d)[,.](\d{3})\s*-->", block.timecode or "")
         if match is None:
             review_logs.append(f"[확인필요] 자막 #{block.sequence}: 시작시간 형식 확인 필요\n  {block.timecode}")
@@ -171,7 +181,6 @@ def evaluate_file(
         hours, minutes, seconds, milliseconds = map(int, match.groups())
         start = ((hours * 60 + minutes) * 60 + seconds) * 1000 + milliseconds
         timestamp = f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
-        sequence = (block.sequence or "").strip()
         if previous_start is not None and start < previous_start[1]:
             review_logs.append(
                 f"[확인필요] 자막 #{sequence}: 시작시간 역행\n"

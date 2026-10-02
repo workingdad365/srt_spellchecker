@@ -209,6 +209,43 @@ def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, mo
     assert [path.read_bytes() for path in paths] == originals
 
 
+@pytest.mark.parametrize("marker", ["krCc", "eGcC", "&nbsp;"])
+def test_evaluation_review_markers_gui(window, app, tmp_path, monkeypatch, marker):
+    path = tmp_path / "markers.srt"
+    content = f"31\n00:00:01,000 --> 00:00:02,000\n{marker}\n"
+    path.write_bytes(content.encode("utf-8"))
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            return text
+
+    monkeypatch.setattr(gui, "create_spacer", Spacer)
+    window._files_loaded([path])
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    assert table.item(0, 1).text() == "검토 필요"
+    assert table.item(0, 2).text() == "0"
+    assert "자막 #31, 본문 1줄" in table.item(0, 1).toolTip()
+    assert marker in table.item(0, 5).text()
+    assert "문자열 발견" in window.log_view.toPlainText()
+    assert table.cellWidget(0, 5).isEnabled()
+    table.cellWidget(0, 5).click()
+    dialog = next(dialog for dialog in window.findChildren(QDialog) if dialog.isVisible())
+    details = dialog.findChild(QPlainTextEdit).toPlainText()
+    assert "자막 #31, 본문 1줄" in details and marker in details
+    dialog.close()
+    csv_path = tmp_path / "markers.csv"
+    monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(csv_path), "CSV (*.csv)"))
+    window.export_evaluation_csv()
+    with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.reader(stream))
+    assert rows[1][1] == "검토 필요"
+    assert "자막 #31, 본문 1줄" in rows[1][-1] and marker in rows[1][-1]
+    assert path.read_bytes() == content.encode("utf-8")
+
+
 @pytest.mark.parametrize("skipped", [0, 1, 2])
 def test_evaluation_encoding_timeline_review_dialog_csv_and_filter(window, app, tmp_path, monkeypatch, skipped):
     paths = [tmp_path / "normal.srt", tmp_path / "timeline.srt"]

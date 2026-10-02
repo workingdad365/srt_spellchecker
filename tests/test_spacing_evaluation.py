@@ -210,6 +210,53 @@ def test_malformed_start_time_is_reported_for_manual_review(tmp_path):
     assert "자막 #1: 시작시간 형식 확인 필요" in result.review_logs[0]
 
 
+@pytest.mark.parametrize(("body", "markers"), [
+    ("KRCC", ["KRCC"]), ("krCc", ["KRCC"]),
+    ("EGCC", ["EGCC"]), ("<i>eGcC</i>", ["EGCC"]),
+    ("&nbsp", ["&nbsp"]), ("안녕&nbsp;하세요", ["&nbsp"]), ("&NBSP;", ["&nbsp"]),
+    ("KRCC egcc &nbsp; KRCC", ["KRCC", "EGCC", "&nbsp"]),
+    ("정상 문장", []), ("KRC EGC nbsp", []),
+])
+def test_review_markers_are_detected_without_changing_source(tmp_path, body, markers):
+    path = tmp_path / "markers.srt"
+    source = f"15\n00:00:01,000 --> 00:00:02,000\n정상\n{body}\n"
+    path.write_bytes(source.encode("utf-8"))
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            return text
+
+    result = evaluate_file(path, Spacer())
+    assert result.error_count == result.skipped_line_count == 0
+    assert len(result.review_logs) == bool(markers)
+    if markers:
+        assert "자막 #15, 본문 2줄" in result.review_logs[0]
+        assert f"문자열 발견 ({', '.join(markers)})" in result.review_logs[0]
+        assert body in result.review_logs[0]
+    assert path.read_bytes() == source.encode("utf-8")
+
+
+def test_marker_review_coexists_with_skipped_lines_and_timeline_review(tmp_path):
+    path = tmp_path / "combined.srt"
+    path.write_text(
+        "1\n00:00:03,000 --> 00:00:04,000\nkrcc\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\negcc\n&nbsp;\n\n"
+        "3\n잘못된 시간 --> 00:00:05,000\nKRCC\n", encoding="utf-8",
+    )
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            return text + "!"
+
+    result = evaluate_file(path, Spacer())
+    assert result.skipped_line_count == 4
+    assert result.errors_per_1000 is None
+    assert len(result.review_logs) == 6
+    assert sum("문자열 발견" in entry for entry in result.review_logs) == 4
+    assert any("자막 #2: 시작시간 역행" in entry for entry in result.review_logs)
+    assert any("자막 #3: 시작시간 형식 확인 필요" in entry for entry in result.review_logs)
+
+
 def test_non_whitespace_change_skips_only_affected_line(tmp_path):
     path = tmp_path / "partial.srt"
     source = (
