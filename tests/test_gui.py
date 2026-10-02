@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import csv
+import os
 import tomllib
 import subprocess
 import sys
@@ -535,6 +536,51 @@ def test_export_csv_failure_preserves_existing_file(window, tmp_path, monkeypatc
     assert path.read_text(encoding="utf-8") == "existing"
     assert "CSV 저장 실패" in window.status_label.text()
     assert window.export_button.isEnabled()
+
+
+def test_real_kiwi_evaluation_with_cpu_autodetection(tmp_path):
+    source = tmp_path / "real.srt"
+    source.write_text("1\n00:00:01,000 --> 00:00:02,000\n안녕 하세요\n", encoding="utf-8")
+    script = """
+import sys
+import time
+from pathlib import Path
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication
+from app_settings import AppSettings
+from srt_spellchecker_gui import MainWindow
+
+application = QApplication([])
+settings = AppSettings(QSettings(sys.argv[1], QSettings.Format.IniFormat))
+settings.load_key = lambda service: None
+settings.save_key = lambda service, key: None
+window = MainWindow(settings)
+window._files_loaded([Path(sys.argv[2])])
+window.evaluation_radio.click()
+window.start_button.click()
+assert window.worker is not None
+deadline = time.monotonic() + 30
+while window.worker is not None and time.monotonic() < deadline:
+    application.processEvents()
+    time.sleep(0.01)
+assert window.worker is None, "평가 완료 시간 초과"
+table = window.evaluation_table
+assert [table.item(0, column).text() for column in (1, 2, 3)] == ["완료", "1", "5"]
+assert window.export_button.isEnabled()
+assert "실패 0개" in window.status_label.text()
+window.close()
+"""
+    environment = os.environ.copy()
+    environment.pop("KIWI_ARCH_TYPE", None)
+    environment.update(QT_QPA_PLATFORM="offscreen", PYTHONIOENCODING="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "settings.ini"), str(source)],
+        cwd=Path(gui.__file__).parent, env=environment, capture_output=True,
+        encoding="utf-8", timeout=45, check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert result.returncode == 0, f"종료 코드 {result.returncode:#x}\n{result.stderr}"
+    assert source.read_text(encoding="utf-8").endswith("안녕 하세요\n")
 
 
 def test_evaluation_worker_cancel_and_initialization_failure(app, tmp_path, monkeypatch):
