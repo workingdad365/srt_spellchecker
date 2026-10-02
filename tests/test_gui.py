@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import codecs
 import csv
+import ctypes
 import os
 import tomllib
 import subprocess
 import sys
 from pathlib import Path
 from threading import Event, Lock
+from types import SimpleNamespace
 
 import httpx
 import openai
 import pytest
 import shiboken6
 from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QPoint, QPointF, QRect, QSettings, QTimer, Qt, QUrl
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QImage, QPainter, QPalette
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon, QImage, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication, QDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
     QStyleOptionViewItem, QTableWidgetItem,
@@ -608,6 +610,59 @@ def test_version_matches_package_and_titles(window) -> None:
     expected_title = "SRT Spellchecker v1.1.7"
     assert window.windowTitle() == expected_title
     assert any(label.text() == expected_title for label in window.findChildren(QLabel))
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux", "darwin"])
+def test_main_sets_application_identity_and_icon_before_window(app, monkeypatch, platform) -> None:
+    app_ids = []
+    windows = []
+    original_window = gui.MainWindow
+    original_icon = app.windowIcon()
+    original_name = app.applicationName()
+    expected_ids = ["drasys.SRTSpellchecker"] if platform == "win32" else []
+    expected_image = app.style().standardIcon(
+        gui.QStyle.StandardPixmap.SP_FileDialogDetailedView,
+    ).pixmap(32, 32).toImage()
+    assert not expected_image.isNull()
+
+    def application_factory(arguments):
+        assert app_ids == expected_ids
+        return app
+
+    def window_factory():
+        assert app.applicationName() == "SRT Spellchecker"
+        assert not app.windowIcon().isNull()
+        assert app.windowIcon().pixmap(32, 32).toImage() == expected_image
+        widget = original_window()
+        windows.append(widget)
+        widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+        assert widget.windowIcon().pixmap(32, 32).toImage() == expected_image
+        return widget
+
+    def run_event_loop():
+        assert windows[0].isVisible()
+        return 23
+
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(shell32=SimpleNamespace(
+        SetCurrentProcessExplicitAppUserModelID=app_ids.append,
+    )), raising=False)
+    monkeypatch.setattr(gui, "sys", SimpleNamespace(platform=platform, argv=[], exit=sys.exit))
+    monkeypatch.setattr(gui, "QApplication", application_factory)
+    monkeypatch.setattr(gui, "MainWindow", window_factory)
+    monkeypatch.setattr(app, "exec", run_event_loop)
+    app.setWindowIcon(QIcon())
+    try:
+        with pytest.raises(SystemExit) as result:
+            gui.main()
+        assert result.value.code == 23
+        assert app_ids == expected_ids
+    finally:
+        for widget in windows:
+            widget.close()
+            widget.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.setWindowIcon(original_icon)
+        app.setApplicationName(original_name)
 
 
 @pytest.mark.parametrize("dark", [False, True])

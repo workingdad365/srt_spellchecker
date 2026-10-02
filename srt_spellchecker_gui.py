@@ -1288,8 +1288,13 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("drasys.SRTSpellchecker")
     app = QApplication(sys.argv)
     app.setApplicationName("SRT Spellchecker")
+    app.setWindowIcon(app.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
