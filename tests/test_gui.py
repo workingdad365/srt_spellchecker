@@ -433,6 +433,209 @@ def test_evaluation_sorts_only_when_finished(window, app, tmp_path, monkeypatch)
     assert window.evaluation_table.item(0, 0).text() == str(Path(tmp_path.name) / "second.srt")
 
 
+def test_evaluation_preparation_reports_immediately_and_yields_between_batches(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / f"{index}.srt" for index in range(300)]
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    prepared, observed, initialized, evaluated = [], [], [], []
+    original_result = window._evaluation_result
+
+    def record_result(row, state, result):
+        original_result(row, state, result)
+        if state == "대기":
+            prepared.append(row)
+            if len(prepared) == 1:
+                QTimer.singleShot(0, lambda: observed.append((
+                    len(prepared), len(initialized), window.evaluation_table.updatesEnabled(),
+                )))
+
+    monkeypatch.setattr(window, "_evaluation_result", record_result)
+    monkeypatch.setattr(gui, "create_spacer", lambda: initialized.append(True) or object())
+    monkeypatch.setattr(gui, "evaluate_file", lambda path, *_args, **_kwargs: (
+        evaluated.append(path) or gui.EvaluationResult(0, 5)
+    ))
+    window.start_evaluation()
+    worker = window.worker
+    assert worker is not None
+    assert not worker.isRunning()
+    assert not prepared
+    assert "준비" in window.status_label.text()
+    assert f"0/{len(paths)}" in window.status_label.text()
+    assert f"자막 {len(paths)}개" in window.log_view.toPlainText()
+    assert window.progress_bar.minimum() == window.progress_bar.maximum() == 0
+    for control in (
+        window.start_button, window.correction_radio, window.evaluation_radio,
+        window.files_button, window.folder_button, window.clear_button,
+        window.export_button, window.evaluation_table,
+    ):
+        assert not control.isEnabled()
+    assert window.cancel_button.isEnabled()
+    window.start_evaluation()
+    assert window.worker is worker
+    finish_work(window, app)
+    assert len(observed) == 1
+    assert 0 < observed[0][0] < len(paths)
+    assert observed[0][1:] == (0, True)
+    assert initialized == [True]
+    assert evaluated == paths
+    assert window.start_button.isEnabled()
+    assert window.evaluation_table.isEnabled()
+    assert window.evaluation_table.rowCount() == len(paths)
+    assert window.progress_bar.maximum() == window.progress_bar.value() == 1000
+
+
+@pytest.mark.parametrize("when", ["immediately", "between_batches"])
+def test_evaluation_preparation_cancel_and_restart(window, app, tmp_path, monkeypatch, when):
+    paths = [tmp_path / f"{index}.srt" for index in range(240)]
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    prepared, initialized, evaluated = [], [], []
+    original_result = window._evaluation_result
+
+    def record_result(row, state, result):
+        original_result(row, state, result)
+        if state == "대기":
+            prepared.append(row)
+            if len(prepared) == 1 and when == "between_batches":
+                QTimer.singleShot(0, window.cancel_work)
+
+    monkeypatch.setattr(window, "_evaluation_result", record_result)
+    monkeypatch.setattr(gui, "create_spacer", lambda: initialized.append(True) or object())
+    monkeypatch.setattr(gui, "evaluate_file", lambda path, *_args, **_kwargs: (
+        evaluated.append(path) or gui.EvaluationResult(0, 5)
+    ))
+    window.start_evaluation()
+    previous_worker = window.worker
+    if when == "immediately":
+        window.cancel_work()
+    else:
+        wait_until(lambda: window.worker is None)
+        assert 0 < len(prepared) < len(paths)
+    assert window.worker is None
+    assert not initialized
+    assert not evaluated
+    assert "중단" in window.log_view.toPlainText()
+    assert window.start_button.isEnabled()
+    assert not window.cancel_button.isEnabled()
+    assert window.evaluation_table.isEnabled()
+    assert window.progress_bar.minimum() == 0
+    assert window.progress_bar.maximum() == 1000
+    monkeypatch.setattr(window, "_evaluation_result", original_result)
+    window.start_evaluation()
+    assert window.worker is not previous_worker
+    finish_work(window, app)
+    assert initialized == [True]
+    assert evaluated == paths
+    assert window.evaluation_table.rowCount() == len(paths)
+    assert {
+        window.evaluation_table.item(row, 0).toolTip() for row in range(len(paths))
+    } == {str(path) for path in paths}
+    assert window.evaluation_table.isSortingEnabled()
+
+
+def test_close_during_evaluation_preparation_never_initializes_worker(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / f"{index}.srt" for index in range(240)]
+    window._files_loaded(paths)
+    window.key_edit.setText("test-secret")
+    window.evaluation_radio.click()
+    initialized, evaluated = [], []
+    original_result = window._evaluation_result
+
+    def close_after_first_batch(row, state, result):
+        original_result(row, state, result)
+        if row == 0 and state == "대기":
+            QTimer.singleShot(0, window.close)
+
+    monkeypatch.setattr(window, "_evaluation_result", close_after_first_batch)
+    monkeypatch.setattr(gui, "create_spacer", lambda: initialized.append(True) or object())
+    monkeypatch.setattr(gui, "evaluate_file", lambda path, *_args, **_kwargs: evaluated.append(path))
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Yes)
+    window.show()
+    app.processEvents()
+    window.start_evaluation()
+    wait_until(lambda: window.close_pending and window.worker is None and not window.isVisible())
+    app.processEvents()
+    assert not initialized
+    assert not evaluated
+    assert window.key_edit.text() == ""
+    assert window.evaluation_table.updatesEnabled()
+
+
+@pytest.mark.parametrize("outcome", ["complete", "cancel", "close", "failure"])
+def test_evaluation_initialization_reports_progress_and_recovers(window, app, tmp_path, monkeypatch, outcome):
+    paths = [tmp_path / "first.srt", tmp_path / "second.srt"]
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    entered, release, evaluating, finish_evaluation = Event(), Event(), Event(), Event()
+    evaluated, heartbeats = [], []
+
+    def create_spacer():
+        entered.set()
+        assert release.wait(10)
+        if outcome == "failure":
+            raise RuntimeError("초기화 실패")
+        return object()
+
+    def evaluate(path, *_args, **_kwargs):
+        evaluated.append(path)
+        evaluating.set()
+        assert finish_evaluation.wait(10)
+        return gui.EvaluationResult(0, 5)
+
+    monkeypatch.setattr(gui, "create_spacer", create_spacer)
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    window.start_evaluation()
+    try:
+        wait_until(lambda: entered.is_set() and "Kiwi 분석기 초기화 중" in window.log_view.toPlainText())
+        worker = window.worker
+        assert worker is not None and worker.isRunning()
+        assert window.progress_bar.minimum() == window.progress_bar.maximum() == 0
+        assert not window.start_button.isEnabled()
+        assert window.cancel_button.isEnabled()
+        assert not evaluated
+        QTimer.singleShot(0, lambda: heartbeats.append(True))
+        wait_until(lambda: bool(heartbeats))
+        if outcome in {"cancel", "close"}:
+            if outcome == "close":
+                monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Yes)
+                window.close()
+                assert window.close_pending
+            else:
+                window.cancel_button.click()
+            assert window.worker is worker
+            assert worker.isInterruptionRequested()
+            assert not window.start_button.isEnabled()
+            assert not window.cancel_button.isEnabled()
+        release.set()
+        if outcome == "complete":
+            wait_until(lambda: evaluating.is_set() and window.progress_bar.maximum() == 1000)
+            assert "분석" in window.status_label.text()
+            assert "초기화 완료" in window.log_view.toPlainText()
+            assert f"[평가 1/{len(paths)}]" in window.log_view.toPlainText()
+    finally:
+        release.set()
+        finish_evaluation.set()
+        finish_work(window, app)
+    assert window.progress_bar.minimum() == 0
+    assert window.progress_bar.maximum() == 1000
+    assert window.evaluation_table.isEnabled()
+    if outcome == "complete":
+        assert evaluated == paths
+        assert window.progress_bar.value() == 1000
+    else:
+        assert not evaluated
+    if outcome != "close":
+        assert window.start_button.isEnabled()
+    if outcome == "failure":
+        assert "Kiwi 초기화: 초기화 실패" in window.log_view.toPlainText()
+        assert all(window.evaluation_table.item(row, 1).text() == "실패" for row in range(len(paths)))
+        monkeypatch.setattr(gui, "create_spacer", object)
+        window.start_evaluation()
+        finish_work(window, app)
+        assert evaluated == paths
+        assert window.progress_bar.value() == 1000
+
+
 def test_evaluation_frequency_rounding_and_empty_text(window):
     table = window.evaluation_table
     table.setRowCount(3)

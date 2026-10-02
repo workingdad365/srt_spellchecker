@@ -5,6 +5,7 @@ import io
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from PySide6.QtCore import QIODevice, QMimeData, QModelIndex, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
@@ -245,6 +246,7 @@ class EvaluationNumberItem(QTableWidgetItem):
 
 
 class EvaluationWorker(QThread):
+    initialized = Signal()
     file_result = Signal(int, str, object)
     progress = Signal(int)
     log = Signal(str)
@@ -258,9 +260,14 @@ class EvaluationWorker(QThread):
         completed = partial = reviewed = failed = errors = 0
         try:
             check_cancelled(self.isInterruptionRequested)
+            self.log.emit("[준비] Kiwi 분석기 초기화 중")
             spacer = create_spacer()
+            check_cancelled(self.isInterruptionRequested)
+            self.initialized.emit()
+            self.log.emit("[준비 완료] Kiwi 분석기 초기화 완료")
             for index, path in enumerate(self.paths):
                 check_cancelled(self.isInterruptionRequested)
+                self.log.emit(f"[평가 {index + 1}/{len(self.paths)}] {path}")
                 self.file_result.emit(index, "평가 중", None)
                 try:
                     result = evaluate_file(
@@ -327,6 +334,10 @@ class MainWindow(QMainWindow):
         self.review_results: dict[Path, tuple[str, list[str]]] = {}
         self.evaluation_reviews: dict[Path, tuple[str, ...]] = {}
         self.worker: QThread | None = None
+        self._evaluation_next_row = 0
+        self._evaluation_prepare_timer = QTimer(self)
+        self._evaluation_prepare_timer.setInterval(10)
+        self._evaluation_prepare_timer.timeout.connect(self._prepare_evaluation_rows)
         self.correction_workers: dict[Path, CorrectionWorker] = {}
         self._file_progress: dict[Path, int] = {}
         self._correction_stop_reason = "작업 종료"
@@ -620,7 +631,7 @@ class MainWindow(QMainWindow):
             and self.evaluation_table.isSortingEnabled() and self.evaluation_table.rowCount() > 0
         )
         self.start_button.setEnabled(
-            not busy and (
+            not busy and not self.close_pending and (
                 bool(self.paths) if self.evaluation_radio.isChecked() else
                 any(path not in self.completed_paths for path in self.paths)
                 and bool(self.key_edit.text().strip()) and self.selected_model() is not None
@@ -631,8 +642,9 @@ class MainWindow(QMainWindow):
             for worker in (self.worker, self.file_loader, *self.correction_workers.values())
         ))
         self.count_label.setText(f"자막 {len(self.paths)}개")
-        for row, path in enumerate(self.paths):
-            self._update_row_actions(row, path)
+        if can_add:
+            for row, path in enumerate(self.paths):
+                self._update_row_actions(row, path)
 
     def _update_row_actions(self, row: int, path: Path) -> None:
         state = self.table.item(row, 1).text()
@@ -752,6 +764,11 @@ class MainWindow(QMainWindow):
         if worker is not None:
             worker.wait()
             if isinstance(worker, EvaluationWorker):
+                self._evaluation_prepare_timer.stop()
+                self.evaluation_table.setEnabled(True)
+                if self.progress_bar.maximum() == 0:
+                    self.progress_bar.setRange(0, 1000)
+                    self.progress_bar.setValue(0)
                 self.evaluation_table.horizontalHeader().setSortIndicator(2, Qt.SortOrder.DescendingOrder)
                 self.evaluation_table.setSortingEnabled(True)
             if worker.isInterruptionRequested():
@@ -760,7 +777,7 @@ class MainWindow(QMainWindow):
         self._advance_correction()
         self._update_controls()
         if self.close_pending and self.file_loader is None and not self.correction_workers:
-            self.close()
+            QTimer.singleShot(0, self.close)
 
     def show_error(self, message: str) -> None:
         for key in [self.key_edit.text().strip(), *self.keys.values()]:
@@ -1007,25 +1024,67 @@ class MainWindow(QMainWindow):
         self._advance_correction()
 
     def start_evaluation(self) -> None:
-        if self.worker is not None or self.file_loader is not None or self._correction_active or self.correction_workers or not self.paths:
+        if (
+            self.worker is not None or self.file_loader is not None or self._correction_active
+            or self.correction_workers or self.close_pending or not self.paths
+        ):
             return
         self.evaluation_reviews.clear()
-        self.evaluation_table.setSortingEnabled(False)
-        self.evaluation_table.setRowCount(0)
-        for row, path in enumerate(self.paths):
-            self.evaluation_table.insertRow(row)
-            item = QTableWidgetItem(str(Path(path.parent.name) / path.name))
-            item.setToolTip(str(path))
-            self.evaluation_table.setItem(row, 0, item)
-            self._evaluation_result(row, "대기", None)
-        self.progress_bar.setValue(0)
+        self._evaluation_next_row = 0
+        self.evaluation_table.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
         self.log_view.clear()
+        self.log_view.appendPlainText(f"[준비] 간이평가 목록 준비: 자막 {len(self.paths):,}개")
         worker = EvaluationWorker(self.paths, self)
+        worker.initialized.connect(self._evaluation_initialized)
         worker.file_result.connect(self._evaluation_result)
         worker.progress.connect(self.progress_bar.setValue)
         worker.log.connect(self.log_view.appendPlainText)
         worker.summary.connect(self._summary)
-        self._start_worker(worker, "간이평가 중: Kiwi 준비 및 띄어쓰기 분석")
+        worker.finished.connect(self._worker_finished)
+        # 목록 준비 중에도 중복 실행과 파일 목록 변경을 막는다.
+        self.worker = worker
+        self.status_label.setText(f"간이평가 준비 중: 평가 목록 0/{len(worker.paths):,}개")
+        self._update_controls()
+        self._evaluation_prepare_timer.start()
+
+    def _prepare_evaluation_rows(self) -> None:
+        worker = self.worker
+        if not self._evaluation_prepare_timer.isActive() or not isinstance(worker, EvaluationWorker):
+            return
+        table = self.evaluation_table
+        started = perf_counter()
+        table.setUpdatesEnabled(False)
+        try:
+            if self._evaluation_next_row == 0:
+                table.setSortingEnabled(False)
+                table.setRowCount(len(worker.paths))
+            end = min(self._evaluation_next_row + 100, len(worker.paths))
+            for row in range(self._evaluation_next_row, end):
+                path = worker.paths[row]
+                item = QTableWidgetItem(str(Path(path.parent.name) / path.name))
+                item.setToolTip(str(path))
+                table.setItem(row, 0, item)
+                self._evaluation_result(row, "대기", None)
+                self._evaluation_next_row = row + 1
+                if perf_counter() - started >= 0.012:
+                    break
+        finally:
+            table.setUpdatesEnabled(True)
+        self.status_label.setText(
+            f"간이평가 준비 중: 평가 목록 {self._evaluation_next_row:,}/{len(worker.paths):,}개"
+        )
+        if self._evaluation_next_row == len(worker.paths):
+            self._evaluation_prepare_timer.stop()
+            table.setEnabled(True)
+            self.status_label.setText("간이평가 준비 중: Kiwi 분석기 초기화")
+            worker.start()
+
+    def _evaluation_initialized(self) -> None:
+        self.progress_bar.setRange(0, 1000)
+        self.progress_bar.setValue(0)
+        if self.worker is not None and not self.worker.isInterruptionRequested():
+            self.status_label.setText("간이평가 중: 띄어쓰기 분석")
 
     def _evaluation_result(self, row: int, state: str, result: EvaluationResult | None) -> None:
         state_item = QTableWidgetItem(state)
@@ -1256,6 +1315,12 @@ class MainWindow(QMainWindow):
     def cancel_work(self) -> None:
         self._stop_corrections("중단")
         self._file_requests.clear()
+        if self._evaluation_prepare_timer.isActive():
+            self._evaluation_prepare_timer.stop()
+            self.evaluation_table.setRowCount(self._evaluation_next_row)
+            self._summary("간이평가 준비 중단: 파일 분석을 시작하지 않았습니다.")
+            self._worker_finished()
+            return
         for worker in (self.worker, self.file_loader):
             if worker is not None:
                 worker.requestInterruption()
