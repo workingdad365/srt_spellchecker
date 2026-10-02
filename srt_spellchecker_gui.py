@@ -27,7 +27,7 @@ from srt_spellchecker import (
 )
 
 
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 
 
 class TableItemDelegate(QStyledItemDelegate):
