@@ -73,7 +73,40 @@ def test_output_path_for() -> None:
     assert sc.output_path_for(Path("a/b.srt")) == Path("a/b_revised.srt")
 
 
-# --- 검증/되돌림 ---
+@pytest.mark.parametrize("wrap_length", [None, 23])
+@pytest.mark.parametrize(("original", "response", "review"), [
+    (["<ㅑ>나도 그러고 싶지만, ", "빌. 나도 이 트레킹에 새로운 반대자 되겠어!</i>"],
+     ["<i>나도 그러고 싶지만,", "빌, 나도 이 트레킹의 새로운 반대자가 되겠어!</i>"], False),
+    (["<i>설명</i>", "- 대사"], ["설명과 대사"], False),
+    (["첫 줄"], ["첫 줄", "둘째 줄", "셋째 줄"], True),
+    (["첫 줄"], ["첫 줄\n둘째 줄\n셋째 줄"], True),
+    (["첫 줄"], ["첫 줄", "", "셋째 줄"], True),
+    (["원본"], [], True),
+])
+def test_model_response_is_accepted_except_empty_content(tmp_path, original, response, review, wrap_length):
+    content = "181\n00:00:01,000 --> 00:00:02,000\n" + "\n".join(original)
+    blocks = sc.parse_srt_blocks(content)
+    corrector = FakeCorrector(lambda payload: ok([
+        {"id": payload[0]["id"], "corrected_lines": response},
+    ]))
+    revised, logs = sc.revise_subtitles(blocks, corrector, wrap_length=wrap_length)
+    expected = [line for item in response for line in (item.splitlines() or [""])]
+    if not expected or any(not line.strip() for line in expected):
+        expected = original
+    assert revised[0].text_lines == expected
+    assert revised[0].sequence == blocks[0].sequence
+    assert revised[0].timecode == blocks[0].timecode
+    assert all(log.startswith("[확인필요]") for log in logs)
+    assert bool(logs) == (review or (wrap_length is not None and any(len(line) > wrap_length for line in expected)))
+    source = tmp_path / "in.srt"
+    source.write_bytes(content.encode("utf-8"))
+    output, saved_logs = sc.correct_file(source, corrector, wrap_length=wrap_length)
+    assert source.read_bytes() == content.encode("utf-8")
+    assert output.read_bytes() == sc.render_srt(revised, "\n").encode("utf-8")
+    assert saved_logs == logs
+
+
+# --- 결과 수용 및 검토 ---
 
 
 @pytest.mark.parametrize("wrap_length", [None, 80])
@@ -101,7 +134,7 @@ def test_dialogue_accepts_commas_without_review(wrap_length) -> None:
     lines, notes = sc.sanitize_lines(
         ["네 맞아", "/안녕 하세요"], ["네, 맞아", "/안녕하세요"], wrap_length,
     )
-    assert lines == ["- 네, 맞아", "- 안녕하세요"]
+    assert lines == ["네, 맞아", "/안녕하세요"]
     assert notes == []
 
 
@@ -135,7 +168,7 @@ def test_multiple_added_marks_do_not_create_review_logs(wrap_length) -> None:
 
 def test_dialogue_accepts_unicode_punctuation_changes() -> None:
     lines, notes = sc.sanitize_lines(["안녕.", "/정말?"], ["안녕!", "/정말？"], None)
-    assert lines == ["- 안녕!", "- 정말？"]
+    assert lines == ["안녕!", "/정말？"]
     assert notes == []
 
 
@@ -192,7 +225,7 @@ def test_sentence_period_removed_before_wrap_length_validation() -> None:
 
 def test_sentence_period_dialogue_and_added_exclamation() -> None:
     lines, notes = sc.sanitize_lines(["안녕하세요.", "/잠깐…"], ["안녕하세요!", "/잠깐..."], None)
-    assert lines == ["- 안녕하세요!", "- 잠깐..."]
+    assert lines == ["안녕하세요!", "/잠깐..."]
     assert notes == []
 
 
@@ -228,10 +261,10 @@ def test_new_ellipsis_is_accepted(wrap_length) -> None:
     assert notes == []
 
 
-def test_ellipsis_fallback_and_dialogue_formatting() -> None:
+def test_ellipsis_dialogue_merge_is_accepted() -> None:
     lines, notes = sc.sanitize_lines(["잠깐..", "/왜…"], ["잠깐... 왜..."], None)
-    assert lines == ["- 잠깐...", "- 왜..."]
-    assert notes[0].startswith("[되돌림]")
+    assert lines == ["잠깐... 왜..."]
+    assert notes == []
 
 
 @pytest.mark.parametrize("response_kind", ["echo", "missing", "failed"])
@@ -264,25 +297,27 @@ def test_sanitize_accepts_plain_sentence_merge() -> None:
 def test_boundary_review_preserves_exact_response(response):
     original = ["- 첫 줄", "- 둘째 줄"]
     lines, notes = sc.sanitize_lines(original, response, None)
-    assert lines == original
-    assert f"모델 응답({len(response)}줄): {json.dumps(response, ensure_ascii=False)}" in notes[0]
+    assert lines == ([line for item in response for line in item.splitlines()] if response else original)
+    if not response:
+        assert notes[0].startswith("[확인필요] 빈 교정 결과")
+        assert f"모델 응답({len(response)}줄): {json.dumps(response, ensure_ascii=False)}" in notes[0]
+    else:
+        assert notes == []
     assert len(response) != len(original)
 
 
-def test_dialogue_review_shows_original_and_normalized_lines():
+def test_dialogue_merge_keeps_model_words_and_normalizes_punctuation():
     original = ["첫 화자의", "긴 대사", "/둘째 화자"]
     lines, notes = sc.sanitize_lines(original, ["모두 합친 응답."], None)
-    assert lines == ["- 첫 화자의 긴 대사", "- 둘째 화자"]
-    assert '원본(검증 전, 3줄): ["첫 화자의", "긴 대사", "/둘째 화자"]' in notes[0]
-    assert '모델 응답(1줄): ["모두 합친 응답."]' in notes[0]
-    assert '검사 원본(정리 후, 2줄): ["- 첫 화자의 긴 대사", "- 둘째 화자"]' in notes[0]
-    assert '검사 응답(정리 후, 1줄): ["모두 합친 응답"]' in notes[0]
+    assert lines == ["모두 합친 응답"]
+    assert notes == []
 
 
-def test_empty_response_review_preserves_blank_lines():
+def test_empty_response_review_records_blank_lines_and_keeps_original():
     lines, notes = sc.sanitize_lines(["원본"], ["", "  "], 23)
     assert lines == ["원본"]
-    assert notes[0].startswith("[되돌림] 빈 교정 결과")
+    assert notes[0].startswith("[확인필요] 빈 교정 결과")
+    assert '원본(1줄): ["원본"]' in notes[0]
     assert '모델 응답(2줄): ["", "  "]' in notes[0]
 
 
@@ -317,10 +352,10 @@ def test_sanitize_wrap_accepts_valid_model_split() -> None:
     assert notes == []
 
 
-def test_sanitize_wrap_rewraps_when_model_ignores_limit() -> None:
+def test_sanitize_wrap_only_reviews_when_model_ignores_limit() -> None:
     lines, notes = sc.sanitize_lines(["가나다 라마바 사아자 차카타"], ["가나다 라마바 사아자 차카타"], 8)
-    assert lines == ["가나다 라마바", "사아자 차카타"]
-    assert notes[0].startswith("[재분할]")
+    assert lines == ["가나다 라마바 사아자 차카타"]
+    assert notes == ["[확인필요] 8자 초과: 모델 교정 결과 유지, 줄 길이 수동 편집 필요"]
 
 
 def test_sanitize_wrap_flags_when_rule_cannot_be_met() -> None:
@@ -340,11 +375,12 @@ def test_sanitize_wrap_accepts_added_punctuation() -> None:
 
 @pytest.mark.parametrize("wrap_length", [None, 23])
 @pytest.mark.parametrize("second_prefix", ["/", "/ ", "-", "-   "])
-def test_dialogue_markers_are_normalized(second_prefix, wrap_length) -> None:
+def test_dialogue_markers_are_prepared_but_response_is_kept(second_prefix, wrap_length) -> None:
     original = ["아메리카노 한 잔 주세요", second_prefix + "예 손님, 잠시만 기다려 주세요"]
     expected = ["- 아메리카노 한 잔 주세요", "- 예 손님, 잠시만 기다려 주세요"]
+    assert sc.prepare_subtitle_lines(original) == expected
     lines, notes = sc.sanitize_lines(original, original, wrap_length)
-    assert lines == expected
+    assert lines == original
     assert notes == []
 
 
@@ -357,7 +393,7 @@ def test_dialogue_allows_markers_and_new_punctuation() -> None:
 
 @pytest.mark.parametrize("wrap_length", [None, 23])
 @pytest.mark.parametrize("response_kind", ["original", "prefixed", "merged"])
-def test_multiline_first_speaker_is_merged_without_punctuation_revert(wrap_length, response_kind):
+def test_multiline_first_speaker_follows_model_line_structure(wrap_length, response_kind):
     original = ["노부시(일종의 산적)가 다 털고 간 뒤에", "나타나선 떵떵거릴걸?", "/ 맞아, 맞아"]
     expected = ["- 노부시(일종의 산적)가 다 털고 간 뒤에 나타나선 떵떵거릴걸?", "- 맞아, 맞아"]
     responses = {
@@ -366,9 +402,10 @@ def test_multiline_first_speaker_is_merged_without_punctuation_revert(wrap_lengt
         "merged": expected,
     }
     lines, notes = sc.sanitize_lines(original, responses[response_kind], wrap_length)
-    assert lines == expected
+    assert lines == responses[response_kind]
     assert not any(note.startswith("[되돌림]") for note in notes)
-    assert notes == ([] if wrap_length is None else ["[확인필요] 23자/2줄 초과: 대사·서식 구분 유지"])
+    assert notes == (["[확인필요] 23자 초과: 모델 교정 결과 유지, 줄 길이 수동 편집 필요"]
+                     if wrap_length is not None and any(len(line) > wrap_length for line in lines) else [])
     assert len(original) == 3
 
 
@@ -376,13 +413,15 @@ def test_multiline_first_speaker_is_merged_without_punctuation_revert(wrap_lengt
 def test_multiline_both_speakers_are_grouped(marker):
     original = ["첫 화자의", "긴 대사", marker + "둘째 화자의", "긴 대사"]
     expected = ["- 첫 화자의 긴 대사", "- 둘째 화자의 긴 대사"]
-    assert sc.sanitize_lines(original, original, None) == (expected, [])
+    assert sc.prepare_subtitle_lines(original) == expected
+    assert sc.sanitize_lines(original, original, None) == (original, [])
 
 
 def test_three_speakers_are_not_collapsed_into_two():
     original = ["첫 화자", "/둘째 화자", "/셋째 화자"]
     expected = ["- 첫 화자", "- 둘째 화자", "- 셋째 화자"]
-    assert sc.sanitize_lines(original, original, None) == (expected, [])
+    assert sc.prepare_subtitle_lines(original) == expected
+    assert sc.sanitize_lines(original, original, None) == (original, [])
 
 
 @pytest.mark.parametrize("wrap_length", [None, 80])
@@ -457,7 +496,7 @@ def test_html_dialogue_marker_relocation_keeps_length_review():
     original = ["<i>- 안녕하세요</i>", "<i>- 반갑습니다</i>"]
     response = ["- <i>안녕하세요</i>", "- <i>반갑습니다</i>"]
     assert sc.sanitize_lines(original, response, 8) == (
-        response, ["[확인필요] 8자/2줄 초과: 대사·서식 구분 유지"],
+        response, ["[확인필요] 8자 초과: 모델 교정 결과 유지, 줄 길이 수동 편집 필요"],
     )
 
 
@@ -475,11 +514,11 @@ def test_html_dialogue_marker_relocation_keeps_length_review():
     (['<font color="yellow">- 안녕</font>', "- 어!"], ['- <font color="red">안녕</font>', "- 어!"]),
     (["<i>- 안녕</i>", "<i>- 반가워</i>"], ["- <i>안녕 반가워</i>"]),
 ])
-def test_merged_speech_or_changed_caption_boundary_reverts(original, response, wrap_length):
+def test_merged_speech_or_changed_caption_boundary_is_accepted(original, response, wrap_length):
     lines, notes = sc.sanitize_lines(original, response, wrap_length)
-    assert lines == original
-    assert notes[0].startswith("[되돌림] 대사·서식 경계 불일치")
-    assert json.dumps(response, ensure_ascii=False) in notes[0]
+    assert lines == response
+    assert notes == (["[확인필요] 23자 초과: 모델 교정 결과 유지, 줄 길이 수동 편집 필요"]
+                     if wrap_length is not None and any(len(line) > wrap_length for line in response) else [])
 
 
 @pytest.mark.parametrize("original", [
@@ -536,11 +575,19 @@ def test_final_speech_line_count_review_preserves_blocks(wrap_length, response_k
         return echo(payload)
 
     revised, logs = sc.revise_subtitles(blocks, FakeCorrector(responder), wrap_length=wrap_length)
-    assert revised == blocks
+    final_lines = [" ".join(original)] if response_kind == "merged" else original
+    assert revised[0] == blocks[0].model_copy(update={"text_lines": final_lines})
+    assert revised[1:] == blocks[1:]
     reviews = [log for log in logs if log.startswith("[확인필요]")]
-    assert reviews == ([
-        f"[확인필요] 자막 #72: 최종 자막 {line_count}줄: 최대 2줄 초과, 타임스탬프 분리 등 수동 편집 필요"
-    ] if line_count > 2 else [])
+    expected_reviews = []
+    if wrap_length is not None and any(len(line) > wrap_length for line in final_lines):
+        expected_reviews.append("[확인필요] 자막 #72: 23자 초과: 모델 교정 결과 유지, 줄 길이 수동 편집 필요")
+    if len(final_lines) > 2:
+        expected_reviews.append(
+            f"[확인필요] 자막 #72: 최종 자막 {line_count}줄: 최대 2줄 초과, 타임스탬프 분리 등 수동 편집 필요"
+        )
+    assert reviews == expected_reviews
+    assert not any(log.startswith("[되돌림]") for log in logs)
 
 
 def test_unmarked_three_line_result_also_needs_review():
@@ -562,11 +609,43 @@ def test_three_lines_reduced_to_two_do_not_need_line_count_review():
 
 
 @pytest.mark.parametrize("wrap_length", [None, 23])
-@pytest.mark.parametrize("response", [[], [""], ["  ", ""]])
-def test_empty_plain_response_still_reverts(wrap_length, response):
-    lines, notes = sc.sanitize_lines(["원본"], response, wrap_length)
-    assert lines == ["원본"]
-    assert notes[0].startswith("[되돌림] 빈 교정 결과")
+@pytest.mark.parametrize("response", [
+    [], [""], ["  ", ""], ["수정", "", "본문"], ["수정", " \t ", "본문"],
+    ["수정\n\n본문"], ["수정\r\n \r\n본문"], ["수정\n"], ["수정\r\n"], ["\n수정"],
+])
+def test_empty_response_or_line_keeps_original_for_review(tmp_path, wrap_length, response):
+    original = ["원본 첫 줄", "원본 둘째 줄"]
+    lines, notes = sc.sanitize_lines(original, response, wrap_length)
+    assert lines == original
+    assert len(notes) == 1
+    assert notes[0].startswith("[확인필요]")
+    assert "원본 유지, 수동 확인 필요" in notes[0]
+    assert json.dumps(response, ensure_ascii=False) in notes[0]
+    source = tmp_path / "in.srt"
+    content = "1\n00:00:01,000 --> 00:00:02,000\n" + "\n".join(original) + "\n"
+    source.write_bytes(content.encode("utf-8"))
+    corrector = FakeCorrector(lambda payload: ok([
+        {"id": payload[0]["id"], "corrected_lines": response},
+    ]))
+    output, logs = sc.correct_file(source, corrector, wrap_length=wrap_length)
+    assert output.read_bytes() == source.read_bytes() == content.encode("utf-8")
+    assert len(logs) == 1
+    assert "원본 유지, 수동 확인 필요" in logs[0]
+
+
+@pytest.mark.parametrize("response", [[], ["수정", ""]])
+def test_empty_response_fallback_keeps_final_length_and_line_count_review(response):
+    original = ["첫 번째 원본 문장", "두 번째 원본 문장", "세 번째 원본 문장"]
+    blocks = sc.parse_srt_blocks("1\n00:00:01,000 --> 00:00:02,000\n" + "\n".join(original))
+    corrector = FakeCorrector(lambda payload: ok([
+        {"id": payload[0]["id"], "corrected_lines": response},
+    ]))
+    revised, logs = sc.revise_subtitles(blocks, corrector, wrap_length=8)
+    assert revised == blocks
+    assert len(logs) == 3
+    assert "원본 유지, 수동 확인 필요" in logs[0]
+    assert logs[1] == "[확인필요] 자막 #1: 8자 초과: 원본 유지, 줄 길이 수동 편집 필요"
+    assert logs[2].startswith("[확인필요] 자막 #1: 최종 자막 3줄:")
 
 
 def test_multiline_dialogue_keeps_srt_structure_and_sends_two_lines():
@@ -589,17 +668,22 @@ def test_multiline_dialogue_keeps_srt_structure_and_sends_two_lines():
 
 @pytest.mark.parametrize("wrap_length", [None, 23])
 @pytest.mark.parametrize("corrected", [["한 잔 주세요 잠시만요"], ["한 잔 주세요", ""]])
-def test_dialogue_keeps_two_speakers_on_invalid_response(wrap_length, corrected) -> None:
-    lines, notes = sc.sanitize_lines(["한 잔 주세요", "/잠시만요"], corrected, wrap_length)
-    assert lines == ["- 한 잔 주세요", "- 잠시만요"]
-    assert notes[0].startswith("[되돌림]")
+def test_dialogue_accepts_model_merge_except_blank_line(wrap_length, corrected) -> None:
+    original = ["한 잔 주세요", "/잠시만요"]
+    lines, notes = sc.sanitize_lines(original, corrected, wrap_length)
+    if "" in corrected:
+        assert lines == original
+        assert notes[0].startswith("[확인필요] 교정 결과에 빈 줄 포함: 원본 유지")
+    else:
+        assert lines == corrected
+        assert notes == []
 
 
 def test_dialogue_wrap_does_not_move_words_between_speakers() -> None:
     original = ["아메리카노 한 잔 주세요", "/네"]
     lines, notes = sc.sanitize_lines(original, original, 12)
-    assert lines == ["- 아메리카노 한 잔 주세요", "- 네"]
-    assert notes == ["[확인필요] 12자/2줄 초과: 대사·서식 구분 유지"]
+    assert lines == original
+    assert notes == ["[확인필요] 12자 초과: 모델 교정 결과 유지, 줄 길이 수동 편집 필요"]
 
 
 @pytest.mark.parametrize("original", [

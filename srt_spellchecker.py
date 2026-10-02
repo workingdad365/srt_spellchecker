@@ -203,85 +203,28 @@ def sanitize_lines(
     corrected_lines: list[str],
     wrap_length: int | None,
 ) -> tuple[list[str], list[str]]:
-    """모델 교정 결과를 검증해 (확정 줄 목록, 검토 로그)를 반환한다."""
+    """빈 결과·빈 줄만 원문으로 대체하고 그 외 모델 결과와 수동 검토 로그를 반환한다."""
     notes: list[str] = []
-    source_lines = list(original_lines)
-    response_lines = list(corrected_lines)
-
-    def revert_note(reason: str) -> str:
-        details = [
-            f"[되돌림] {reason}",
-            f"  원본(검증 전, {len(source_lines)}줄): {json.dumps(source_lines, ensure_ascii=False)}",
-            f"  모델 응답({len(response_lines)}줄): {json.dumps(response_lines, ensure_ascii=False)}",
-        ]
-        if original_lines != source_lines:
-            details.append(
-                f"  검사 원본(정리 후, {len(original_lines)}줄): {json.dumps(original_lines, ensure_ascii=False)}"
-            )
-        if corrected_lines != response_lines:
-            details.append(
-                f"  검사 응답(정리 후, {len(corrected_lines)}줄): {json.dumps(corrected_lines, ensure_ascii=False)}"
-            )
-        return "\n".join(details)
-
-    original_lines = [normalize_subtitle_punctuation(line) for line in original_lines]
-    corrected_lines = [normalize_subtitle_punctuation(line) for line in corrected_lines]
-
-    original_lines = expand_subtitle_lines(original_lines)
-    corrected_lines = expand_subtitle_lines(corrected_lines)
-    segments = subtitle_segments(original_lines)
-    if len(segments) > 1:
-        source_line_count = len(original_lines)
-        original_lines = format_subtitle_segments(segments)
-        if len(corrected_lines) == source_line_count:
-            response_segments = []
-            offset = 0
-            for group in segments:
-                response_segments.append(corrected_lines[offset:offset + len(group)])
-                offset += len(group)
-        elif len(corrected_lines) == len(segments):
-            response_segments = [[line] for line in corrected_lines]
-        else:
-            response_segments = subtitle_segments(corrected_lines)
-        candidate = format_subtitle_segments(response_segments)
-        # 서식은 설명 자막의 단서일 수 있으므로 같은 위치에 유지한다.
-        tags = lambda line: re.findall(r"<[^>]+>|\{\\[^}]+\}", line)
-        dialogue_marker = re.compile(r"^\s*(?:<[A-Za-z][^>]*>\s*)*[-/]")
-        valid = len(candidate) == len(original_lines) and all(
-            re.sub(r"^[-/]\s*", "", new.strip(), count=1).strip()
-            and tags(old) == tags(new)
-            and (not tags(old) or bool(dialogue_marker.match(old)) == bool(dialogue_marker.match(new)))
-            for old, new in zip(original_lines, candidate)
+    lines = [
+        normalize_subtitle_punctuation(line)
+        for response in corrected_lines
+        for line in re.split(r"\r\n|\r|\n", response)
+    ]
+    empty_reason = None
+    if not any(line.strip() for line in lines):
+        empty_reason = "빈 교정 결과"
+    elif any(not line.strip() for line in lines):
+        empty_reason = "교정 결과에 빈 줄 포함"
+    if empty_reason:
+        notes.append(
+            f"[확인필요] {empty_reason}: 원본 유지, 수동 확인 필요\n"
+            f"  원본({len(original_lines)}줄): {json.dumps(original_lines, ensure_ascii=False)}\n"
+            f"  모델 응답({len(corrected_lines)}줄): {json.dumps(corrected_lines, ensure_ascii=False)}"
         )
-        if not valid:
-            notes.append(revert_note("대사·서식 경계 불일치로 원본 구성 유지"))
-            result = original_lines
-        else:
-            # 응답에서 생략된 대사 표식도 원본 구분에 맞춰 복구한다.
-            result = [
-                "- " + re.sub(r"^[-/]\s*", "", new.strip(), count=1)
-                if old.startswith("- ") and not tags(old) else new
-                for old, new in zip(original_lines, candidate)
-            ]
-        if wrap_length is not None and any(len(line) > wrap_length for line in result):
-            notes.append(f"[확인필요] {wrap_length}자/{MAX_WRAPPED_LINES}줄 초과: 대사·서식 구분 유지")
-        return result, notes
-
-    lines = [line.strip() for line in corrected_lines if line.strip()]
-    if not lines:
-        notes.append(revert_note("빈 교정 결과로 원본 유지"))
-        lines = list(original_lines)
-
-    if wrap_length is not None and violates_wrap_rules(lines, wrap_length):
-        rewrapped = rewrap_lines(lines, wrap_length)
-        if rewrapped is None:
-            notes.append(
-                f"[확인필요] {wrap_length}자/{MAX_WRAPPED_LINES}줄 규칙을 맞출 수 없음"
-            )
-        else:
-            notes.append("[재분할] 줄 길이 규칙 위반으로 코드에서 다시 나눔")
-            lines = rewrapped
-
+        lines = [normalize_subtitle_punctuation(line) for line in original_lines]
+    if wrap_length is not None and any(len(line) > wrap_length for line in lines):
+        preserved = "원본 유지" if empty_reason else "모델 교정 결과 유지"
+        notes.append(f"[확인필요] {wrap_length}자 초과: {preserved}, 줄 길이 수동 편집 필요")
     return lines, notes
 
 
