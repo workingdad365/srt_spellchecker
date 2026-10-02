@@ -153,11 +153,11 @@ def test_undecodable_or_invalid_source_is_not_replaced(tmp_path, raw):
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16"])
 @pytest.mark.parametrize(("prefix", "invalid"), [
     ("1\r", False), ("1 ", True), ("1 \r", True),
-    ("1", True), ("01", True), ("01 ", True), (" 1 ", True),
+    ("1", False), ("01", True), ("01 ", True), (" 1 ", True),
     ("0 ", True), ("2 ", True), ("100 ", True), ("1\t", True), ("1\u00a0", True),
     ("\n1 ", True), ("메모\n\n1 ", True),
 ])
-def test_file_must_start_with_literal_one_and_crlf(tmp_path, prefix, invalid, encoding):
+def test_file_must_start_with_literal_one_and_crlf_or_lf(tmp_path, prefix, invalid, encoding):
     path = tmp_path / "number.srt"
     source = (
         f"{prefix}\n00:00:01,000 --> 00:00:02,000\n본문\n\n"
@@ -173,7 +173,7 @@ def test_file_must_start_with_literal_one_and_crlf(tmp_path, prefix, invalid, en
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == int(invalid)
     if invalid:
-        assert '파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
+        assert '파일 시작이 "1\\r\\n" 또는 "1\\n"이 아님' in result.review_logs[0]
         assert "파일 시작:" in result.review_logs[0]
     assert path.read_bytes() == source.encode("utf-8-sig" if encoding == "utf-16" else encoding)
 
@@ -201,7 +201,7 @@ def test_timeline_review_records_every_immediate_start_regression(tmp_path, enco
     assert len(calls) == 6
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == 3
-    assert '자막 #9: 파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
+    assert '자막 #9: 파일 시작이 "1\\r\\n" 또는 "1\\n"이 아님' in result.review_logs[0]
     assert "자막 #12: 시작시간 역행" in result.review_logs[1]
     assert "직전 자막 #11: 01:00:00,001" in result.review_logs[1]
     assert "현재 자막 #12: 01:00:00,000" in result.review_logs[1]
@@ -251,7 +251,7 @@ def test_end_time_must_be_strictly_after_start(tmp_path, start, end, invalid):
     result = evaluate_file(path, Spacer())
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == 1 + int(invalid)
-    assert '자막 #42: 파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
+    assert '자막 #42: 파일 시작이 "1\\r\\n" 또는 "1\\n"이 아님' in result.review_logs[0]
     if invalid:
         assert "자막 #42: 종료시간이 시작시간보다 같거나 빠름" in result.review_logs[1]
         assert f"시작시간: {start.replace('.', ',')}" in result.review_logs[1]
@@ -309,7 +309,7 @@ def test_review_markers_are_detected_without_changing_source(tmp_path, body, mar
     result = evaluate_file(path, Spacer())
     assert result.error_count == result.skipped_line_count == 0
     assert len(result.review_logs) == 1 + bool(markers)
-    assert '자막 #15: 파일 시작이 "1\\r\\n"이 아님' in result.review_logs[0]
+    assert '자막 #15: 파일 시작이 "1\\r\\n" 또는 "1\\n"이 아님' in result.review_logs[0]
     if markers:
         assert "자막 #15, 본문 2줄" in result.review_logs[1]
         assert f"문자열 발견 ({', '.join(markers)})" in result.review_logs[1]
