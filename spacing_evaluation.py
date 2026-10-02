@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,6 +18,11 @@ class Spacer(Protocol):
 class EvaluationResult:
     error_count: int
     character_count: int
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def skipped_line_count(self) -> int:
+        return len(self.warnings)
 
     @property
     def errors_per_1000(self) -> float | None:
@@ -59,20 +65,34 @@ def evaluate_file(
     blocks = [block for block in parse_srt_blocks(content) if block.is_subtitle]
     if not blocks:
         raise ValueError("평가할 SRT 자막 블록이 없습니다.")
-    lines = [line for block in blocks for line in block.text_lines]
+    lines = [
+        (block.sequence, line_number, line)
+        for block in blocks
+        for line_number, line in enumerate(block.text_lines, start=1)
+    ]
     count = 0
     character_count = 0
-    for index, line in enumerate(lines):
+    warnings: list[str] = []
+    for index, (sequence, line_number, line) in enumerate(lines):
         check_cancelled(is_cancelled)
         # 본문에 섞인 BOM 문자는 분석과 글자 수 집계에서 제외한다.
         text = re.sub(r"<[^>]+>|\{\\[^}]*\}", "", line.replace("\ufeff", "")).strip()
         text = re.sub(r"^[-/]\s*", "", text)
         if text:
-            character_count += sum(not character.isspace() for character in text)
             corrected = spacer.space(text, reset_whitespace=True)
             check_cancelled(is_cancelled)
-            count += spacing_error_count(text, corrected)
+            try:
+                line_errors = spacing_error_count(text, corrected)
+            except ValueError:
+                warnings.append(
+                    f"자막 #{sequence}, 본문 {line_number}줄: 공백 외 문자 변경으로 평가에서 제외\n"
+                    f"  분석 입력: {json.dumps(text, ensure_ascii=False)}\n"
+                    f"  Kiwi 결과: {json.dumps(corrected, ensure_ascii=False)}"
+                )
+            else:
+                count += line_errors
+                character_count += sum(not character.isspace() for character in text)
         if on_progress is not None:
             on_progress(index + 1, len(lines))
     check_cancelled(is_cancelled)
-    return EvaluationResult(count, character_count)
+    return EvaluationResult(count, character_count, tuple(warnings))

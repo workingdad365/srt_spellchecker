@@ -239,7 +239,7 @@ class EvaluationWorker(QThread):
         self.paths = list(paths)
 
     def run(self) -> None:
-        completed = failed = errors = 0
+        completed = partial = failed = errors = 0
         try:
             check_cancelled(self.isInterruptionRequested)
             spacer = create_spacer()
@@ -253,9 +253,17 @@ class EvaluationWorker(QThread):
                             int((row + done / total) / len(self.paths) * 1000)
                         ),
                     )
-                    completed += 1
-                    errors += result.error_count
-                    self.file_result.emit(index, "완료", result)
+                    for warning in result.warnings:
+                        self.log.emit(f"[제외] {path}: {warning}")
+                    if result.skipped_line_count and not result.character_count:
+                        failed += 1
+                        self.file_result.emit(index, "평가 불가", result)
+                    else:
+                        completed += 1
+                        errors += result.error_count
+                        if result.skipped_line_count:
+                            partial += 1
+                        self.file_result.emit(index, "부분 평가" if result.skipped_line_count else "완료", result)
                 except CorrectionCancelled:
                     self.file_result.emit(index, "중단", None)
                     raise
@@ -273,8 +281,9 @@ class EvaluationWorker(QThread):
             failed = len(self.paths)
         finally:
             state = "평가 중단" if self.isInterruptionRequested() else "평가 종료"
+            partial_summary = f" (부분 평가 {partial}개)" if partial else ""
             self.summary.emit(
-                f"{state}: 완료 {completed}개, 오류 {errors}건, 실패 {failed}개, "
+                f"{state}: 완료 {completed}개{partial_summary}, 오류 {errors}건, 실패 {failed}개, "
                 f"미처리 {len(self.paths) - completed - failed}개"
             )
 
@@ -984,7 +993,14 @@ class MainWindow(QMainWindow):
         self._start_worker(worker, "간이평가 중: Kiwi 준비 및 띄어쓰기 분석")
 
     def _evaluation_result(self, row: int, state: str, result: EvaluationResult | None) -> None:
-        self.evaluation_table.setItem(row, 1, QTableWidgetItem(state))
+        state_item = QTableWidgetItem(state)
+        state_item.setData(Qt.ItemDataRole.UserRole, state)
+        if result is not None and result.skipped_line_count:
+            state_item.setText(f"{state} ({result.skipped_line_count}줄 제외)")
+            state_item.setToolTip("\n\n".join(result.warnings))
+        self.evaluation_table.setItem(row, 1, state_item)
+        if state == "평가 불가":
+            result = None
         self.evaluation_table.setItem(row, 2, EvaluationNumberItem(result.error_count if result else None))
         self.evaluation_table.setItem(row, 3, EvaluationNumberItem(result.character_count if result else None))
         self.evaluation_table.setItem(row, 4, EvaluationNumberItem(
@@ -1004,7 +1020,10 @@ class MainWindow(QMainWindow):
             if path_item is None or state_item is None or rate_item is None:
                 continue
             rate = rate_item.data(Qt.ItemDataRole.UserRole)
-            if state_item.text() == "완료" and rate is not None and rate >= threshold and path_item.toolTip():
+            if (
+                state_item.data(Qt.ItemDataRole.UserRole) in {"완료", "부분 평가"}
+                and rate is not None and rate >= threshold and path_item.toolTip()
+            ):
                 kept_paths.add(Path(path_item.toolTip()))
         kept_paths.intersection_update(self.paths)
         removed_count = len(self.paths) - len(kept_paths)

@@ -162,6 +162,50 @@ def test_evaluation_mode_without_api_and_numeric_sort(window, app, tmp_path, mon
     assert window.table.item(0, 2).text() == str(Path(tmp_path.name) / "two_revised.srt")
 
 
+def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / name for name in ("partial.srt", "unscorable.srt", "normal.srt")]
+    for path, body in zip(paths, ["오류\n반갑 습니다", "오류", "안녕하세요"]):
+        path.write_text("388\n00:00:01,000 --> 00:00:02,000\n" + body + "\n", encoding="utf-8")
+    originals = [path.read_bytes() for path in paths]
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            return "오류!" if text == "오류" else text.replace(" ", "")
+
+    monkeypatch.setattr(gui, "create_spacer", Spacer)
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    table.sortItems(4, Qt.SortOrder.DescendingOrder)
+    assert [table.item(row, 0).toolTip() for row in range(3)] == [str(paths[index]) for index in (0, 2, 1)]
+    assert table.item(0, 1).text() == "부분 평가 (1줄 제외)"
+    assert "자막 #388, 본문 1줄" in table.item(0, 1).toolTip()
+    assert [table.item(0, column).text() for column in (2, 3, 4)] == ["1", "5", "200.00"]
+    assert table.item(1, 1).text() == "완료"
+    assert table.item(2, 1).text() == "평가 불가 (1줄 제외)"
+    assert [table.item(2, column).text() for column in (2, 3, 4)] == ["—", "—", "—"]
+    assert "완료 2개 (부분 평가 1개), 오류 1건, 실패 1개, 미처리 0개" in window.status_label.text()
+    assert window.progress_bar.value() == 1000
+    assert f"[제외] {paths[0]}: 자막 #388" in window.log_view.toPlainText()
+    assert 'Kiwi 결과: "오류!"' in window.log_view.toPlainText()
+    csv_path = tmp_path / "partial.csv"
+    monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(csv_path), "CSV (*.csv)"))
+    window.export_button.click()
+    with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.reader(stream))
+    assert rows[1][1:] == ["부분 평가 (1줄 제외)", "1", "5", "200.00"]
+    assert rows[3][1:] == ["평가 불가 (1줄 제외)", "—", "—", "—"]
+    window.evaluation_threshold_spin.setValue(100)
+    window.filter_evaluation_button.click()
+    assert window.paths == [paths[0]]
+    assert table.rowCount() == 1
+    window.correction_radio.click()
+    assert window.paths == [paths[0]]
+    assert [path.read_bytes() for path in paths] == originals
+
+
 @pytest.mark.parametrize(("threshold", "kept_indices"), [
     (0.0, [0, 1, 2, 3, 6]), (0.33, [1, 2, 3]), (101.0, []),
 ])

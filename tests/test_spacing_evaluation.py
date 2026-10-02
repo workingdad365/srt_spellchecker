@@ -46,6 +46,88 @@ def test_evaluate_only_subtitle_text_without_writing(tmp_path, encoding):
     assert list(tmp_path.iterdir()) == [path]
 
 
+def test_non_whitespace_change_skips_only_affected_line(tmp_path):
+    path = tmp_path / "partial.srt"
+    source = (
+        "387\n00:00:01,000 --> 00:00:02,000\n안녕 하세요\n\n"
+        "388\n00:00:03,000 --> 00:00:04,000\n"
+        "<i>이게 교회의 권위를 았아가려는</i>\n/ 반갑 습니다\n"
+    )
+    path.write_bytes(source.encode("utf-8"))
+    calls = []
+
+    class Spacer:
+        def space(self, text, *, reset_whitespace):
+            assert reset_whitespace
+            calls.append(text)
+            if "았아가려는" in text:
+                return "이게 교회의 권위 를 ᆯ았아 가려는"
+            return text.replace(" ", "")
+
+    progress = []
+    result = evaluate_file(path, Spacer(), on_progress=lambda *args: progress.append(args))
+    assert result.error_count == 2
+    assert result.character_count == 10
+    assert result.errors_per_1000 == 200
+    assert result.skipped_line_count == 1
+    assert "자막 #388, 본문 1줄" in result.warnings[0]
+    assert "공백 외 문자 변경" in result.warnings[0]
+    assert "이게 교회의 권위를 았아가려는" in result.warnings[0]
+    assert "이게 교회의 권위 를 ᆯ았아 가려는" in result.warnings[0]
+    assert calls[-1] == "반갑 습니다"
+    assert progress == [(1, 3), (2, 3), (3, 3)]
+    assert path.read_bytes() == source.encode("utf-8")
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_all_lines_changed_have_no_valid_error_rate(tmp_path):
+    path = tmp_path / "unscorable.srt"
+    path.write_text("1\n00:00:01,000 --> 00:00:02,000\n첫 줄\n둘째 줄\n", encoding="utf-8")
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            return text + "!"
+
+    result = evaluate_file(path, Spacer())
+    assert result.error_count == result.character_count == 0
+    assert result.errors_per_1000 is None
+    assert result.skipped_line_count == 2
+    assert "본문 1줄" in result.warnings[0]
+    assert "본문 2줄" in result.warnings[1]
+
+
+def test_spacer_execution_errors_are_not_skipped(tmp_path):
+    path = tmp_path / "error.srt"
+    path.write_text("1\n00:00:01,000 --> 00:00:02,000\n안녕\n", encoding="utf-8")
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            raise ValueError("분석기 실행 오류")
+
+    with pytest.raises(ValueError, match="분석기 실행 오류"):
+        evaluate_file(path, Spacer())
+
+
+def test_cancel_after_skipped_line_stops_evaluation(tmp_path):
+    path = tmp_path / "cancel.srt"
+    path.write_text("1\n00:00:01,000 --> 00:00:02,000\n첫 줄\n둘째 줄\n", encoding="utf-8")
+    calls = []
+    progress = []
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            calls.append(text)
+            return text + "!"
+
+    with pytest.raises(CorrectionCancelled):
+        evaluate_file(
+            path, Spacer(), is_cancelled=lambda: bool(progress),
+            on_progress=lambda *args: progress.append(args),
+        )
+    assert calls == ["첫 줄"]
+    assert progress == [(1, 2)]
+
+
 def test_cancel_before_reading():
     with pytest.raises(CorrectionCancelled):
         evaluate_file(Path("missing.srt"), None, is_cancelled=lambda: True)
