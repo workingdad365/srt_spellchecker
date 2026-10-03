@@ -533,6 +533,9 @@ class MainWindow(QMainWindow):
         ])
         self.evaluation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.evaluation_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.evaluation_table.setStyleSheet(
+            "QTableWidget::item:selected { background-color: #2563eb; color: #ffffff; }"
+        )
         self.evaluation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
