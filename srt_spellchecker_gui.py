@@ -532,6 +532,7 @@ class MainWindow(QMainWindow):
             "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수", "검토",
         ])
         self.evaluation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.evaluation_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
