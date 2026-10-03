@@ -16,7 +16,7 @@ import openai
 import pytest
 import shiboken6
 from PySide6.QtCore import QEvent, QEventLoop, QMimeData, QPoint, QPointF, QRect, QSettings, QTimer, Qt, QUrl
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon, QImage, QPainter, QPalette
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon, QImage, QMouseEvent, QPainter, QPalette
 from PySide6.QtWidgets import (
     QApplication, QDialog, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
     QStyleOptionViewItem, QTableWidgetItem,
@@ -1055,6 +1055,105 @@ def test_evaluation_frequency_rounding_and_empty_text(window):
     assert table.item(2, 3).text() == "0"
     table.sortItems(4, Qt.SortOrder.DescendingOrder)
     assert [table.item(row, 3).text() for row in range(3)] == ["3000", "3001", "0"]
+
+
+def prepare_evaluation_mouse_table(window, app, tmp_path):
+    window.evaluation_radio.click()
+    table = window.evaluation_table
+    table.setRowCount(3)
+    paths = [tmp_path / name for name in ("first.srt", "second.srt", "third.srt")]
+    for row, path in enumerate(paths):
+        item = QTableWidgetItem(path.name)
+        item.setToolTip(str(path))
+        table.setItem(row, 0, item)
+        window._evaluation_result(row, "완료", gui.EvaluationResult(row + 1, 100))
+    window.show()
+    app.processEvents()
+    return table, paths
+
+
+def send_table_mouse_event(table, event_type, row, column=0, *, button=Qt.MouseButton.NoButton,
+                           buttons=Qt.MouseButton.NoButton):
+    position = table.visualRect(table.model().index(row, column)).center()
+    event = QMouseEvent(
+        event_type, QPointF(position), QPointF(table.viewport().mapToGlobal(position)),
+        button, buttons, Qt.KeyboardModifier.NoModifier,
+    )
+    QApplication.sendEvent(table.viewport(), event)
+
+
+@pytest.mark.parametrize("button", [Qt.MouseButton.RightButton, Qt.MouseButton.MiddleButton])
+def test_evaluation_mouse_selection_ignores_hover_and_nonleft_buttons(window, app, tmp_path, button):
+    table, _paths = prepare_evaluation_mouse_table(window, app, tmp_path)
+    left = Qt.MouseButton.LeftButton
+    send_table_mouse_event(table, QEvent.Type.MouseButtonPress, 0, button=left, buttons=left)
+    send_table_mouse_event(table, QEvent.Type.MouseButtonRelease, 0, button=left)
+    expected = {(0, column) for column in range(table.columnCount())}
+    for row in (1, 2):
+        send_table_mouse_event(table, QEvent.Type.MouseMove, row)
+        assert {(index.row(), index.column()) for index in table.selectedIndexes()} == expected
+    image = table.viewport().grab().toImage()
+    scale = image.devicePixelRatio()
+
+    def background(row):
+        rect = table.visualRect(table.model().index(row, 0))
+        return image.pixelColor(int((rect.right() - 10) * scale), int((rect.bottom() - 6) * scale))
+
+    assert background(0) == QColor("#2563eb")
+    dark = table.palette().base().color().lightness() < 128
+    assert background(2) == QColor("#353535" if dark else "#eeeeee")
+    for event_type, row, pressed_buttons in (
+        (QEvent.Type.MouseButtonPress, 1, button),
+        (QEvent.Type.MouseButtonRelease, 1, Qt.MouseButton.NoButton),
+        (QEvent.Type.MouseButtonDblClick, 1, button),
+        (QEvent.Type.MouseButtonRelease, 1, Qt.MouseButton.NoButton),
+        (QEvent.Type.MouseMove, 2, button),
+    ):
+        send_table_mouse_event(
+            table, event_type, row, 2,
+            button=Qt.MouseButton.NoButton if event_type == QEvent.Type.MouseMove else button,
+            buttons=pressed_buttons,
+        )
+        assert {(index.row(), index.column()) for index in table.selectedIndexes()} == expected
+
+
+def test_evaluation_mouse_selection_recovers_when_drag_release_is_missing(window, app, tmp_path):
+    table, _paths = prepare_evaluation_mouse_table(window, app, tmp_path)
+    left = Qt.MouseButton.LeftButton
+    send_table_mouse_event(table, QEvent.Type.MouseButtonPress, 0, button=left, buttons=left)
+    send_table_mouse_event(table, QEvent.Type.MouseMove, 1, buttons=left)
+    assert {index.row() for index in table.selectedIndexes()} == {0, 1}
+    assert table.state() == gui.QAbstractItemView.State.DragSelectingState
+    send_table_mouse_event(table, QEvent.Type.MouseMove, 2)
+    assert {index.row() for index in table.selectedIndexes()} == {0, 1}
+    assert table.state() == gui.QAbstractItemView.State.NoState
+    send_table_mouse_event(table, QEvent.Type.MouseButtonPress, 2, button=left, buttons=left)
+    send_table_mouse_event(table, QEvent.Type.MouseButtonRelease, 2, button=left)
+    assert {index.row() for index in table.selectedIndexes()} == {2}
+    send_table_mouse_event(table, QEvent.Type.MouseMove, 0)
+    assert {index.row() for index in table.selectedIndexes()} == {2}
+
+
+def test_evaluation_mouse_selection_and_double_click_follow_sorted_file(window, app, tmp_path, monkeypatch):
+    table, paths = prepare_evaluation_mouse_table(window, app, tmp_path)
+    left = Qt.MouseButton.LeftButton
+    send_table_mouse_event(table, QEvent.Type.MouseButtonPress, 0, button=left, buttons=left)
+    send_table_mouse_event(table, QEvent.Type.MouseButtonRelease, 0, button=left)
+    table.setSortingEnabled(True)
+    table.sortItems(2, Qt.SortOrder.DescendingOrder)
+    assert table.item(2, 0).toolTip() == str(paths[0])
+    assert {index.row() for index in table.selectedIndexes()} == {2}
+    send_table_mouse_event(table, QEvent.Type.MouseMove, 0)
+    assert {index.row() for index in table.selectedIndexes()} == {2}
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl", lambda url: opened.append(url) or True)
+    for column in (0, 1):
+        send_table_mouse_event(table, QEvent.Type.MouseButtonPress, 0, column, button=left, buttons=left)
+        send_table_mouse_event(table, QEvent.Type.MouseButtonRelease, 0, column, button=left)
+        send_table_mouse_event(table, QEvent.Type.MouseButtonDblClick, 0, column, button=left, buttons=left)
+        send_table_mouse_event(table, QEvent.Type.MouseButtonRelease, 0, column, button=left)
+        assert {index.row() for index in table.selectedIndexes()} == {0}
+    assert opened == [QUrl.fromLocalFile(str(paths[2])), QUrl.fromLocalFile(str(paths[2].parent))]
 
 
 def test_evaluation_double_click_opens_sorted_rows_file_and_folder(window, tmp_path, monkeypatch):

@@ -8,8 +8,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from PySide6.QtCore import QIODevice, QMimeData, QModelIndex, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QEvent, QIODevice, QItemSelectionModel, QMimeData, QModelIndex, QSaveFile, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QBrush, QColor, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QCompleter, QDialog, QDoubleSpinBox,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -42,6 +42,26 @@ class TableItemDelegate(QStyledItemDelegate):
             ):
                 dark = option.palette.base().color().lightness() < 128
                 option.backgroundBrush = QBrush(QColor("#353535" if dark else "#eeeeee"))
+
+
+class EvaluationTable(QTableWidget):
+    def selectionCommand(self, index: QModelIndex, event: QEvent | None = None) -> QItemSelectionModel.SelectionFlag:
+        if isinstance(event, QMouseEvent):
+            left_button = (
+                bool(event.buttons() & Qt.MouseButton.LeftButton)
+                if event.type() == QEvent.Type.MouseMove else event.button() == Qt.MouseButton.LeftButton
+            )
+            if not left_button:
+                return QItemSelectionModel.SelectionFlag.NoUpdate
+        return super().selectionCommand(index, event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if not event.buttons() & Qt.MouseButton.LeftButton:
+            # 다른 창에서 버튼을 놓아 해제 이벤트가 누락된 경우에도 드래그 선택을 종료한다.
+            self.stopAutoScroll()
+            if self.state() == QAbstractItemView.State.DragSelectingState:
+                self.setState(QAbstractItemView.State.NoState)
+        super().mouseMoveEvent(event)
 
 
 class FileTable(QTableWidget):
@@ -543,7 +563,7 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._update_controls)
         self.table.cellDoubleClicked.connect(self.open_subtitle_target)
         splitter.addWidget(self.table)
-        self.evaluation_table = QTableWidget(0, 7)
+        self.evaluation_table = EvaluationTable(0, 7)
         self.evaluation_table.setItemDelegate(TableItemDelegate(self.evaluation_table))
         self.evaluation_table.setMouseTracking(True)
         self.evaluation_table.cellDoubleClicked.connect(self.open_evaluation_target)
