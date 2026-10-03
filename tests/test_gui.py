@@ -212,6 +212,62 @@ def test_partial_evaluation_status_logs_csv_and_filter(window, app, tmp_path, mo
     assert [path.read_bytes() for path in paths] == originals
 
 
+def test_evaluation_status_sort_uses_review_count_and_preserves_csv_and_filter(
+    window, app, tmp_path, monkeypatch,
+):
+    bodies = {
+        "one.srt": ["KRCC " + "[확인필요] " * 12, "안 녕 하 세 요", *(["제외"] * 12)],
+        "completed.srt": ["안 녕 하 세 요"],
+        "three.srt": ["KRCC"] * 3,
+        "unscorable.srt": ["KRCC 제외"],
+        "two.srt": ["KRCC", "KRCC", "안 녕 하 세 요"],
+        "ten.srt": [*(["KRCC"] * 10), "제외"],
+    }
+    paths = [tmp_path / name for name in bodies]
+    for path in paths:
+        body = "\n".join(bodies[path.name])
+        path.write_text(f"1\n00:00:01,000 --> 00:00:02,000\n{body}\n", encoding="utf-8")
+
+    class Spacer:
+        def space(self, text, **_kwargs):
+            return text + "!" if text.endswith("제외") else text.replace(" ", "")
+
+    monkeypatch.setattr(gui, "create_spacer", Spacer)
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    table.sortItems(1, Qt.SortOrder.AscendingOrder)
+    expected_names = ["ten.srt", "three.srt", "two.srt", "one.srt", "completed.srt", "unscorable.srt"]
+    assert [Path(table.item(row, 0).toolTip()).name for row in range(table.rowCount())] == expected_names
+    assert [len(window.evaluation_reviews[tmp_path / name]) for name in expected_names[:4]] == [10, 3, 2, 1]
+    assert table.item(0, 1).text() == "검토 필요 (부분 평가, 1줄 제외)"
+    assert table.item(3, 1).text() == "검토 필요 (부분 평가, 12줄 제외)"
+    assert [table.item(row, 1).data(Qt.ItemDataRole.UserRole) for row in range(6)] == [
+        "검토 필요", "검토 필요", "검토 필요", "검토 필요", "완료", "평가 불가",
+    ]
+    assert int(table.item(3, 2).text()) > int(table.item(0, 2).text())
+    assert table.item(3, 5).text().count("[확인필요]") > table.item(0, 5).text().count("[확인필요]")
+    csv_path = tmp_path / "status_sorted.csv"
+    monkeypatch.setattr(gui.QFileDialog, "getSaveFileName", lambda *args: (str(csv_path), "CSV (*.csv)"))
+    window.export_button.click()
+    with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.reader(stream))
+    assert rows == [
+        [table.horizontalHeaderItem(column).text() for column in range(6)],
+        *[[table.item(row, column).text() for column in range(6)] for row in range(6)],
+    ]
+
+    table.sortItems(1, Qt.SortOrder.DescendingOrder)
+    assert [Path(table.item(row, 0).toolTip()).name for row in range(6)] == list(reversed(expected_names))
+    table.sortItems(1, Qt.SortOrder.AscendingOrder)
+    window.evaluation_threshold_spin.setValue(0)
+    window.filter_evaluation_button.click()
+    assert window.paths == [path for path in paths if path.name != "unscorable.srt"]
+    assert [Path(table.item(row, 0).toolTip()).name for row in range(table.rowCount())] == expected_names[:-1]
+
+
 @pytest.mark.parametrize(("marker", "timecode", "review_location", "reason"), [
     ("31", "00:00:01,000 --> 00:00:02,000", "자막 #31", '파일 시작이 "1\\r\\n" 또는 "1\\n"이 아님'),
     ("krCc", "00:00:01,000 --> 00:00:02,000", "자막 #31, 본문 1줄", "문자열 발견"),
@@ -724,6 +780,63 @@ def test_evaluation_recheck_reads_edited_subtitle_without_rechecking_other_files
     assert window.evaluation_reviews[other] == other_reviews
     assert other.read_bytes() == other_bytes
     assert target.read_text(encoding="utf-8") == edited
+
+
+@pytest.mark.parametrize("remaining_count", [7, 1, 0])
+def test_evaluation_recheck_repositions_status_sorted_row_by_latest_review_count(
+    window, app, tmp_path, monkeypatch, remaining_count,
+):
+    paths = [tmp_path / name for name in ("target.srt", "high.srt", "low.srt", "completed.srt")]
+    target, high, low, completed = paths
+    for path, count in zip(paths, (3, 5, 2, 0)):
+        body = "\n".join(["KRCC"] * count) if count else "안녕하세요"
+        path.write_text(f"1\n00:00:01,000 --> 00:00:02,000\n{body}\n", encoding="utf-8")
+    calls = []
+    evaluate_file = gui.evaluate_file
+
+    def evaluate(path, spacer, **kwargs):
+        calls.append(path)
+        return evaluate_file(path, spacer, **kwargs)
+
+    monkeypatch.setattr(gui, "create_spacer", lambda: SimpleNamespace(space=lambda text, **kwargs: text))
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    table.sortItems(1, Qt.SortOrder.AscendingOrder)
+    assert [table.item(row, 0).toolTip() for row in range(4)] == [str(path) for path in (high, target, low, completed)]
+    others_before = {path: evaluation_values(table, path) for path in paths if path != target}
+    reviews_before = {path: logs for path, logs in window.evaluation_reviews.items() if path != target}
+    calls.clear()
+    body = "\n".join(["EGCC"] * remaining_count) if remaining_count else "수정했습니다"
+    target.write_text(f"1\n00:00:01,000 --> 00:00:02,000\n{body}\n", encoding="utf-8")
+    table.cellWidget(evaluation_row(table, target), 6).click()
+    finish_work(window, app)
+
+    assert calls == [target]
+    assert table.isSortingEnabled()
+    assert table.horizontalHeader().sortIndicatorSection() == 1
+    assert table.horizontalHeader().sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+    assert table.rowCount() == len(paths)
+    for path, values in others_before.items():
+        assert evaluation_values(table, path) == values
+    assert {path: logs for path, logs in window.evaluation_reviews.items() if path != target} == reviews_before
+    assert len(window.evaluation_reviews.get(target, ())) == remaining_count
+    row = evaluation_row(table, target)
+    assert table.cellWidget(row, 6).isEnabled() == bool(remaining_count)
+    if remaining_count:
+        expected = (target, high, low, completed) if remaining_count > 5 else (high, low, target, completed)
+        assert [table.item(index, 0).toolTip() for index in range(4)] == [str(path) for path in expected]
+        assert table.item(row, 1).text() == "검토 필요"
+        assert "EGCC" in table.item(row, 5).text()
+        assert "KRCC" not in table.item(row, 5).text()
+    else:
+        assert [table.item(index, 0).toolTip() for index in range(2)] == [str(high), str(low)]
+        assert row >= 2
+        assert table.item(row, 1).text() == "완료"
+        assert not table.item(row, 5).text()
 
 
 @pytest.mark.parametrize("remaining_logs", [(), ("[확인필요] 자막 #99: 새 검토 내역",)])

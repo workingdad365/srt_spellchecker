@@ -235,6 +235,23 @@ class CorrectionWorker(QThread):
             )
 
 
+class EvaluationStatusItem(QTableWidgetItem):
+    def __init__(self, state: str, review_count: int = 0) -> None:
+        super().__init__(state)
+        self.setData(Qt.ItemDataRole.UserRole, state)
+        self.review_count = review_count
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:
+        if (
+            isinstance(other, EvaluationStatusItem)
+            and self.data(Qt.ItemDataRole.UserRole) == other.data(Qt.ItemDataRole.UserRole) == "검토 필요"
+            and self.review_count != other.review_count
+        ):
+            return self.review_count > other.review_count
+        # PySide의 기본 비교 연산자 재진입을 피하기 위해 문자열을 직접 비교한다.
+        return self.text() < other.text()
+
+
 class EvaluationNumberItem(QTableWidgetItem):
     def __init__(self, value: int | float | None, *, decimals: int | None = None) -> None:
         text = "—" if value is None else str(value) if decimals is None else f"{value:.{decimals}f}"
@@ -547,6 +564,9 @@ class MainWindow(QMainWindow):
         self.evaluation_table.setColumnWidth(5, 44)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         self.evaluation_table.setColumnWidth(6, 64)
+        self.evaluation_table.horizontalHeaderItem(1).setToolTip(
+            "검토 필요를 먼저 정렬하면 같은 상태 안에서 확인 필요 건수가 많은 파일부터 표시"
+        )
         self.evaluation_table.horizontalHeaderItem(3).setToolTip(
             "평가 대상 본문의 문자 수: 공백·줄바꿈·서식 태그·줄 시작 대사 표식 제외, 문장부호 포함"
         )
@@ -1167,9 +1187,8 @@ class MainWindow(QMainWindow):
             self.evaluation_table.setSortingEnabled(sorting)
 
     def _evaluation_result(self, row: int, state: str, result: EvaluationResult | None) -> None:
-        state_item = QTableWidgetItem(state)
-        state_item.setData(Qt.ItemDataRole.UserRole, state)
         review_logs = result.review_logs if result is not None else ()
+        state_item = EvaluationStatusItem(state, len(review_logs))
         label = state
         if review_logs and state != "검토 필요":
             label += " / 검토 필요"
