@@ -334,6 +334,8 @@ class MainWindow(QMainWindow):
         self.review_results: dict[Path, tuple[str, list[str]]] = {}
         self.evaluation_reviews: dict[Path, tuple[str, ...]] = {}
         self.worker: QThread | None = None
+        self._evaluation_recheck_path: Path | None = None
+        self._evaluation_recheck_sorting = False
         self._evaluation_next_row = 0
         self._evaluation_prepare_timer = QTimer(self)
         self._evaluation_prepare_timer.setInterval(10)
@@ -524,12 +526,12 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._update_controls)
         self.table.cellDoubleClicked.connect(self.open_subtitle_target)
         splitter.addWidget(self.table)
-        self.evaluation_table = QTableWidget(0, 6)
+        self.evaluation_table = QTableWidget(0, 7)
         self.evaluation_table.setItemDelegate(TableItemDelegate(self.evaluation_table))
         self.evaluation_table.setMouseTracking(True)
         self.evaluation_table.cellDoubleClicked.connect(self.open_evaluation_target)
         self.evaluation_table.setHorizontalHeaderLabels([
-            "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수", "검토",
+            "평가 자막", "평가 상태", "띄어쓰기 오류 수", "글자 수", "1,000자당 오류 수", "검토", "재검토",
         ])
         self.evaluation_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.evaluation_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -543,6 +545,8 @@ class MainWindow(QMainWindow):
             self.evaluation_table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         self.evaluation_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
         self.evaluation_table.setColumnWidth(5, 44)
+        self.evaluation_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
+        self.evaluation_table.setColumnWidth(6, 64)
         self.evaluation_table.horizontalHeaderItem(3).setToolTip(
             "평가 대상 본문의 문자 수: 공백·줄바꿈·서식 태그·줄 시작 대사 표식 제외, 문장부호 포함"
         )
@@ -578,7 +582,7 @@ class MainWindow(QMainWindow):
         self.export_button = self._button(
             "CSV 내보내기", QStyle.StandardPixmap.SP_DialogSaveButton, self.export_evaluation_csv,
         )
-        self.export_button.setToolTip("평가 테이블의 열과 현재 정렬 순서를 그대로 CSV로 저장")
+        self.export_button.setToolTip("평가 결과 데이터의 열과 현재 정렬 순서를 그대로 CSV로 저장")
         self.export_button.hide()
         options.addWidget(self.export_button)
         self.start_button = self._button("교정 시작", QStyle.StandardPixmap.SP_MediaPlay, self.start_correction)
@@ -649,6 +653,16 @@ class MainWindow(QMainWindow):
         if can_add:
             for row, path in enumerate(self.paths):
                 self._update_row_actions(row, path)
+        can_recheck = self._can_recheck_evaluation()
+        known_paths = set(self.paths) if can_recheck else set()
+        for row in range(self.evaluation_table.rowCount()):
+            button = self.evaluation_table.cellWidget(row, 6)
+            path_item = self.evaluation_table.item(row, 0)
+            if button is not None:
+                button.setEnabled(
+                    can_recheck and self._evaluation_needs_review(row)
+                    and path_item is not None and Path(path_item.toolTip()) in known_paths
+                )
 
     def _update_row_actions(self, row: int, path: Path) -> None:
         state = self.table.item(row, 1).text()
@@ -773,8 +787,12 @@ class MainWindow(QMainWindow):
                 if self.progress_bar.maximum() == 0:
                     self.progress_bar.setRange(0, 1000)
                     self.progress_bar.setValue(0)
-                self.evaluation_table.horizontalHeader().setSortIndicator(2, Qt.SortOrder.DescendingOrder)
-                self.evaluation_table.setSortingEnabled(True)
+                if self._evaluation_recheck_path is None:
+                    self.evaluation_table.horizontalHeader().setSortIndicator(2, Qt.SortOrder.DescendingOrder)
+                    self.evaluation_table.setSortingEnabled(True)
+                else:
+                    self.evaluation_table.setSortingEnabled(self._evaluation_recheck_sorting)
+                    self._evaluation_recheck_path = None
             if worker.isInterruptionRequested():
                 self.status_label.setText("작업 중단됨")
             worker.deleteLater()
@@ -1090,6 +1108,64 @@ class MainWindow(QMainWindow):
         if self.worker is not None and not self.worker.isInterruptionRequested():
             self.status_label.setText("간이평가 중: 띄어쓰기 분석")
 
+    def _can_recheck_evaluation(self) -> bool:
+        return (
+            self.worker is None and self.file_loader is None and not self._correction_active
+            and not self.correction_workers and not self.close_pending and self.evaluation_radio.isChecked()
+        )
+
+    def _evaluation_needs_review(self, row: int) -> bool:
+        state = self.evaluation_table.item(row, 1)
+        review = self.evaluation_table.item(row, 5)
+        return bool(
+            state is not None and state.data(Qt.ItemDataRole.UserRole) == "검토 필요"
+            or review is not None and review.text()
+        )
+
+    def _evaluation_row(self, path: Path) -> int | None:
+        for row in range(self.evaluation_table.rowCount()):
+            item = self.evaluation_table.item(row, 0)
+            if item is not None and item.toolTip() == str(path):
+                return row
+        return None
+
+    def recheck_evaluation(self, path: Path) -> None:
+        if not self._can_recheck_evaluation() or path not in self.paths:
+            return
+        row = self._evaluation_row(path)
+        if row is None or not self._evaluation_needs_review(row):
+            return
+        self._evaluation_recheck_path = path
+        self._evaluation_recheck_sorting = self.evaluation_table.isSortingEnabled()
+        self.evaluation_table.setSortingEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.log_view.appendPlainText(f"[재검토] {path}")
+        worker = EvaluationWorker([path], self)
+        worker.initialized.connect(self._evaluation_initialized)
+        worker.file_result.connect(self._recheck_evaluation_result)
+        worker.progress.connect(self.progress_bar.setValue)
+        worker.log.connect(self.log_view.appendPlainText)
+        worker.summary.connect(lambda message: self._summary(f"재검토 ({path.name}): {message}"))
+        self._start_worker(worker, f"재검토 준비 중: {path.name} · Kiwi 분석기 초기화")
+
+    def _recheck_evaluation_result(self, _index: int, state: str, result: EvaluationResult | None) -> None:
+        path = self._evaluation_recheck_path
+        if path is None:
+            return
+        if state == "평가 중" and self.worker is not None and not self.worker.isInterruptionRequested():
+            self.status_label.setText(f"재검토 중: {path.name}")
+        if result is None:
+            return
+        row = self._evaluation_row(path)
+        if row is None:
+            return
+        sorting = self.evaluation_table.isSortingEnabled()
+        self.evaluation_table.setSortingEnabled(False)
+        try:
+            self._evaluation_result(row, state, result)
+        finally:
+            self.evaluation_table.setSortingEnabled(sorting)
+
     def _evaluation_result(self, row: int, state: str, result: EvaluationResult | None) -> None:
         state_item = QTableWidgetItem(state)
         state_item.setData(Qt.ItemDataRole.UserRole, state)
@@ -1117,13 +1193,26 @@ class MainWindow(QMainWindow):
         review_button.setAccessibleName("간이평가 검토 내역")
         path_item = self.evaluation_table.item(row, 0)
         path_text = path_item.toolTip() if path_item is not None else ""
-        if review_logs and path_text:
-            self.evaluation_reviews[Path(path_text)] = review_logs
+        if path_text and result is not None:
+            if review_logs:
+                self.evaluation_reviews[Path(path_text)] = review_logs
+            else:
+                self.evaluation_reviews.pop(Path(path_text), None)
         review_button.setEnabled(bool(review_logs and path_text))
         review_button.clicked.connect(
             lambda _checked=False, path=path_text, logs=review_logs: self._show_review_dialog(Path(path), path, logs)
         )
         self.evaluation_table.setCellWidget(row, 5, review_button)
+        recheck_button = QToolButton()
+        recheck_button.setText("재검토")
+        recheck_button.setToolTip("이 자막만 다시 간이평가")
+        recheck_button.setAccessibleName("자막 재검토")
+        recheck_button.setEnabled(
+            self._can_recheck_evaluation() and self._evaluation_needs_review(row)
+            and bool(path_text) and Path(path_text) in self.paths
+        )
+        recheck_button.clicked.connect(lambda _checked=False, path=path_text: self.recheck_evaluation(Path(path)))
+        self.evaluation_table.setCellWidget(row, 6, recheck_button)
         if state == "평가 불가":
             result = None
         self.evaluation_table.setItem(row, 2, EvaluationNumberItem(result.error_count if result else None))
@@ -1186,13 +1275,15 @@ class MainWindow(QMainWindow):
         table = self.evaluation_table
         buffer = io.StringIO(newline="")
         writer = csv.writer(buffer)
+        # 재검토 버튼을 제외한 결과 데이터 열만 저장한다.
+        data_columns = range(6)
         writer.writerow([
-            table.horizontalHeaderItem(column).text() for column in range(table.columnCount())
+            table.horizontalHeaderItem(column).text() for column in data_columns
         ])
         for row in range(table.rowCount()):
             writer.writerow([
                 table.item(row, column).text() if table.item(row, column) is not None else ""
-                for column in range(table.columnCount())
+                for column in data_columns
             ])
         data = buffer.getvalue().encode("utf-8-sig")
         output = QSaveFile(path)

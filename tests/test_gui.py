@@ -636,6 +636,302 @@ def test_evaluation_initialization_reports_progress_and_recovers(window, app, tm
         assert window.progress_bar.value() == 1000
 
 
+def evaluation_row(table, path):
+    return next(
+        row for row in range(table.rowCount())
+        if table.item(row, 0).toolTip() == str(path)
+    )
+
+
+def evaluation_values(table, path):
+    row = evaluation_row(table, path)
+    return tuple(
+        (table.item(row, column).text(), table.item(row, column).toolTip(),
+         table.item(row, column).data(Qt.ItemDataRole.UserRole))
+        for column in range(6)
+    )
+
+
+def test_evaluation_recheck_buttons_require_current_review_target(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / f"{index}.srt" for index in range(5)]
+    logs = ("[확인필요] 자막 #12: 시작시간 역행",)
+    results = dict(zip(paths, [
+        gui.EvaluationResult(2, 100, review_logs=logs),
+        gui.EvaluationResult(1, 100, warnings=("일부 제외",), review_logs=logs),
+        gui.EvaluationResult(0, 0, warnings=("전체 제외",), review_logs=logs),
+        gui.EvaluationResult(0, 100),
+        gui.EvaluationResult(0, 0, warnings=("전체 제외",)),
+    ]))
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda path, *_args, **_kwargs: results[path])
+    window._files_loaded(paths)
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    assert table.columnCount() == 7
+    assert table.horizontalHeaderItem(6).text() == "재검토"
+    for index, path in enumerate(paths):
+        button = table.cellWidget(evaluation_row(table, path), 6)
+        assert button.text() == "재검토"
+        assert button.isEnabled() == (index < 3)
+
+    window.recheck_evaluation(paths[3])
+    assert window.worker is None
+    window.correction_radio.click()
+    assert not table.cellWidget(evaluation_row(table, paths[0]), 6).isEnabled()
+    window.recheck_evaluation(paths[0])
+    assert window.worker is None
+    window.evaluation_radio.click()
+    assert table.cellWidget(evaluation_row(table, paths[0]), 6).isEnabled()
+    window.remove_waiting_file(paths[0])
+    assert paths[0] not in window.paths
+    assert not table.cellWidget(evaluation_row(table, paths[0]), 6).isEnabled()
+    window.recheck_evaluation(paths[0])
+    assert window.worker is None
+
+
+def test_evaluation_recheck_reads_edited_subtitle_without_rechecking_other_files(window, app, tmp_path, monkeypatch):
+    target, other = tmp_path / "target.srt", tmp_path / "other.srt"
+    target.write_text("31\n00:00:01,000 --> 00:00:02,000\nKRCC\n", encoding="utf-8")
+    other.write_text("1\n00:00:01,000 --> 00:00:02,000\nEGCC\n", encoding="utf-8")
+    other_bytes = other.read_bytes()
+    calls = []
+    evaluate_file = gui.evaluate_file
+
+    def evaluate(path, spacer, **kwargs):
+        calls.append(path)
+        return evaluate_file(path, spacer, **kwargs)
+
+    monkeypatch.setattr(gui, "create_spacer", lambda: SimpleNamespace(space=lambda text, **kwargs: text))
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    window._files_loaded([target, other])
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    other_result = evaluation_values(table, other)
+    other_reviews = window.evaluation_reviews[other]
+    calls.clear()
+    edited = "1\n00:00:01,000 --> 00:00:02,000\n안녕하세요\n"
+    target.write_text(edited, encoding="utf-8")
+    table.cellWidget(evaluation_row(table, target), 6).click()
+    finish_work(window, app)
+    assert calls == [target]
+    assert table.item(evaluation_row(table, target), 1).text() == "완료"
+    assert target not in window.evaluation_reviews
+    assert evaluation_values(table, other) == other_result
+    assert window.evaluation_reviews[other] == other_reviews
+    assert other.read_bytes() == other_bytes
+    assert target.read_text(encoding="utf-8") == edited
+
+
+@pytest.mark.parametrize("remaining_logs", [(), ("[확인필요] 자막 #99: 새 검토 내역",)])
+def test_evaluation_recheck_updates_only_sorted_target_and_latest_reviews(
+    window, app, tmp_path, monkeypatch, remaining_logs,
+):
+    paths = [tmp_path / name for name in ("first.srt", "target.srt", "third.srt")]
+    old_logs = ("[확인필요] 자막 #12: 이전 검토 내역",)
+    results = dict(zip(paths, [
+        gui.EvaluationResult(1, 100),
+        gui.EvaluationResult(10, 100, review_logs=old_logs),
+        gui.EvaluationResult(3, 100, review_logs=("다른 파일 검토 내역",)),
+    ]))
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda path, *_args, **_kwargs: results[path])
+    window._files_loaded(paths)
+    window._store_review(paths[0], "first_revised.srt", ["기존 LLM 검토 내역"])
+    window._file_state(0, "검토 필요", "first_revised.srt")
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    table.sortItems(2, Qt.SortOrder.AscendingOrder)
+    assert evaluation_row(table, paths[1]) == 2
+    before = {path: evaluation_values(table, path) for path in paths}
+    correction_states = [window.table.item(row, 1).text() for row in range(len(paths))]
+    old_reviews = dict(window.review_results)
+    completed = set(window.completed_paths)
+    old_log = window.log_view.toPlainText()
+    initializing, release_initialization, evaluating, release_evaluation = (Event() for _ in range(4))
+    calls = []
+
+    def create_spacer():
+        initializing.set()
+        assert release_initialization.wait(10)
+        return object()
+
+    def evaluate(path, *_args, **_kwargs):
+        calls.append(path)
+        evaluating.set()
+        assert release_evaluation.wait(10)
+        return gui.EvaluationResult(0, 200, review_logs=remaining_logs)
+
+    monkeypatch.setattr(gui, "create_spacer", create_spacer)
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    table.cellWidget(evaluation_row(table, paths[1]), 6).click()
+    try:
+        wait_until(initializing.is_set)
+        worker = window.worker
+        assert worker.paths == [paths[1]]
+        assert window.progress_bar.minimum() == window.progress_bar.maximum() == 0
+        assert window.cancel_button.isEnabled()
+        assert not table.isSortingEnabled()
+        assert all(not table.cellWidget(row, 6).isEnabled() for row in range(len(paths)))
+        for control in (
+            window.start_button, window.filter_evaluation_button, window.export_button,
+            window.files_button, window.folder_button, window.clear_button,
+        ):
+            assert not control.isEnabled()
+        window.recheck_evaluation(paths[1])
+        window.recheck_evaluation(paths[2])
+        window.start_evaluation()
+        window.filter_evaluation_results()
+        window.clear_files()
+        window.remove_waiting_file(paths[1])
+        assert window.worker is worker
+        assert window.paths == paths
+        assert window.log_view.toPlainText().startswith(old_log)
+        assert f"[재검토] {paths[1]}" in window.log_view.toPlainText()
+        release_initialization.set()
+        wait_until(lambda: evaluating.is_set() and window.progress_bar.maximum() == 1000)
+        assert evaluation_values(table, paths[1]) == before[paths[1]]
+    finally:
+        release_initialization.set()
+        release_evaluation.set()
+        finish_work(window, app)
+
+    assert calls == [paths[1]]
+    assert table.rowCount() == len(paths)
+    assert table.isSortingEnabled()
+    assert table.horizontalHeader().sortIndicatorSection() == 2
+    assert table.horizontalHeader().sortIndicatorOrder() == Qt.SortOrder.AscendingOrder
+    assert evaluation_row(table, paths[1]) == 0
+    for path in (paths[0], paths[2]):
+        assert evaluation_values(table, path) == before[path]
+    row = evaluation_row(table, paths[1])
+    assert [table.item(row, column).text() for column in (2, 3, 4)] == ["0", "200", "0.00"]
+    assert table.cellWidget(row, 6).isEnabled() == bool(remaining_logs)
+    assert window.evaluation_reviews.get(paths[1], ()) == remaining_logs
+    assert window.evaluation_reviews[paths[2]] == results[paths[2]].review_logs
+    assert window.review_results == old_reviews
+    assert window.completed_paths == completed
+    assert [window.table.item(row, 1).text() for row in range(len(paths))] == correction_states
+    assert window.log_view.toPlainText().startswith(old_log)
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", lambda path, *_args, **_kwargs: (
+        path.with_stem(path.stem + "_revised"), [],
+    ))
+    window.correction_radio.click()
+    prepare_model(window)
+    window.start_correction()
+    finish_work(window, app)
+    if remaining_logs:
+        assert window.review_results[paths[1]][1] == list(remaining_logs)
+    else:
+        assert paths[1] not in window.review_results
+        assert window.table.item(1, 1).text() == "완료"
+
+
+@pytest.mark.parametrize("outcome", ["failure", "initialization_failure", "cancel", "close"])
+def test_evaluation_recheck_failure_or_cancel_preserves_result_and_allows_retry(
+    window, app, tmp_path, monkeypatch, outcome,
+):
+    path = tmp_path / "target.srt"
+    logs = ("[확인필요] 자막 #12: 시작시간 역행",)
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda *_args, **_kwargs: gui.EvaluationResult(
+        4, 100, review_logs=logs,
+    ))
+    window._files_loaded([path])
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    table = window.evaluation_table
+    table.setSortingEnabled(False)
+    before = evaluation_values(table, path)
+    entered, release = Event(), Event()
+
+    def fail_initialization():
+        entered.set()
+        assert release.wait(10)
+        raise RuntimeError("재검토 초기화 실패")
+
+    def evaluate(_path, _spacer, **kwargs):
+        entered.set()
+        assert release.wait(10)
+        gui.check_cancelled(kwargs["is_cancelled"])
+        raise OSError("재검토 파일 읽기 실패")
+
+    if outcome == "initialization_failure":
+        monkeypatch.setattr(gui, "create_spacer", fail_initialization)
+    monkeypatch.setattr(gui, "evaluate_file", evaluate)
+    window.recheck_evaluation(path)
+    try:
+        wait_until(entered.is_set)
+        if outcome in {"cancel", "close"}:
+            if outcome == "close":
+                monkeypatch.setattr(QMessageBox, "question", lambda *_args: QMessageBox.StandardButton.Yes)
+                window.close()
+                assert window.close_pending
+            else:
+                window.cancel_button.click()
+            assert window.worker.isInterruptionRequested()
+        assert evaluation_values(table, path) == before
+    finally:
+        release.set()
+        finish_work(window, app)
+    assert evaluation_values(table, path) == before
+    assert window.evaluation_reviews[path] == logs
+    assert not table.isSortingEnabled()
+    assert window.progress_bar.maximum() == 1000
+    if outcome == "close":
+        wait_until(lambda: window._restoring)
+        assert not table.cellWidget(0, 6).isEnabled()
+        return
+    assert table.cellWidget(0, 6).isEnabled()
+    assert ("평가 중단" if outcome == "cancel" else "실패") in window.log_view.toPlainText()
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda *_args, **_kwargs: gui.EvaluationResult(0, 100))
+    table.cellWidget(0, 6).click()
+    finish_work(window, app)
+    assert table.item(0, 1).text() == "완료"
+    assert path not in window.evaluation_reviews
+    assert not table.cellWidget(0, 6).isEnabled()
+
+
+@pytest.mark.parametrize("busy_kind", ["worker", "file_loader", "correction_workers", "_correction_active", "close_pending"])
+def test_evaluation_recheck_is_blocked_during_other_work(window, app, tmp_path, monkeypatch, busy_kind):
+    path = tmp_path / "target.srt"
+    monkeypatch.setattr(gui, "create_spacer", object)
+    monkeypatch.setattr(gui, "evaluate_file", lambda *_args, **_kwargs: gui.EvaluationResult(
+        1, 100, review_logs=("검토 필요 내역",),
+    ))
+    window._files_loaded([path])
+    window.evaluation_radio.click()
+    window.start_evaluation()
+    finish_work(window, app)
+    task = gui.BackgroundTask(lambda: None, window)
+    previous = getattr(window, busy_kind)
+    busy_value = (
+        {path: task} if busy_kind == "correction_workers"
+        else True if busy_kind in {"_correction_active", "close_pending"}
+        else task
+    )
+    try:
+        setattr(window, busy_kind, busy_value)
+        window._update_controls()
+        assert not window.evaluation_table.cellWidget(0, 6).isEnabled()
+        window.recheck_evaluation(path)
+        assert window.worker is (task if busy_kind == "worker" else None)
+    finally:
+        setattr(window, busy_kind, previous)
+        window._update_controls()
+        task.deleteLater()
+    assert window.evaluation_table.cellWidget(0, 6).isEnabled()
+
+
 def test_evaluation_frequency_rounding_and_empty_text(window):
     table = window.evaluation_table
     table.setRowCount(3)
