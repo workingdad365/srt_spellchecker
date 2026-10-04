@@ -232,7 +232,8 @@ def test_gui_cancels_all_inflight_requests_without_waiting_for_responses(
             overview.model_id == "test-model" and overview.elapsed_seconds >= 0
             for overview in window.correction_overviews.values()
         )
-        assert all(window.table.cellWidget(row, 4).isEnabled() for row in range(2))
+        if stop == "cancel":
+            assert all(window.table.cellWidget(row, 4).isEnabled() for row in range(2))
         assert not window.table.cellWidget(2, 4).isEnabled()
         assert not window.completed_paths
         assert "[경고]" not in window.log_view.toPlainText()

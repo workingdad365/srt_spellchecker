@@ -1460,7 +1460,7 @@ class MainWindow(QMainWindow):
         path = worker.paths[0]
         worker.wait()
         row = self.paths.index(path)
-        if worker.isInterruptionRequested() and self.table.item(row, 1).text() == "교정 중":
+        if worker.aborted and self.table.item(row, 1).text() == "교정 중":
             self._file_state(row, "중단", "")
         del self.correction_workers[path]
         if worker.aborted and self._correction_active:
