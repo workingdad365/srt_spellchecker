@@ -31,6 +31,10 @@ def test_worklist_round_trip_preserves_order_states_and_reviews(tmp_path) -> Non
         settings.SavedWorkFile(
             path=str(tmp_path / "한글 자막.srt"), state="검토 필요",
             output=str(tmp_path / "한글 자막_revised.srt"), review_logs=["[되돌림] 자막 #13"],
+            overview=settings.CorrectionOverview(
+                service="OpenRouter", model_id="vendor/model", model_name="사용한 모델",
+                elapsed_seconds=3723.25,
+            ),
         ),
         settings.SavedWorkFile(path=str(tmp_path / "next.srt"), state="교정 중"),
     ])
@@ -39,6 +43,25 @@ def test_worklist_round_trip_preserves_order_states_and_reviews(tmp_path) -> Non
     assert restored.load_worklist() == worklist
     store.save_worklist(settings.SavedWorklist())
     assert restored.load_worklist().files == []
+
+
+def test_old_worklist_without_correction_overview_still_loads(tmp_path) -> None:
+    store = settings.AppSettings(QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat))
+    store.worklist_path.write_text(
+        '{"version":1,"files":[{"path":"old.srt","state":"완료","output":"old_revised.srt"}]}',
+        encoding="utf-8",
+    )
+    restored = store.load_worklist()
+    assert restored.files[0].state == "완료"
+    assert restored.files[0].overview is None
+
+
+@pytest.mark.parametrize("elapsed_seconds", [-1, float("inf"), float("-inf"), float("nan")])
+def test_correction_overview_rejects_invalid_elapsed_time(elapsed_seconds) -> None:
+    with pytest.raises(settings.ValidationError):
+        settings.CorrectionOverview(
+            service="OpenAI", model_id="test-model", elapsed_seconds=elapsed_seconds,
+        )
 
 
 @pytest.mark.parametrize("raw", ["not-json", '{"version":2}', '{"files":[{"path":"a.srt","state":"unknown"}]}'])

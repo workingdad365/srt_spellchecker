@@ -1,0 +1,5 @@
+﻿평가 자막,평가 상태,띄어쓰기 오류 수,글자 수,"1,000자당 오류 수",검토
+test_evaluation_encoding_timel0\timeline.srt,검토 필요,2,10,200.00,"[확인필요] 자막 #12: 시작시간 역행
+  직전 자막 #1: 00:00:03,000
+  현재 자막 #12: 00:00:01,000"
+test_evaluation_encoding_timel0\normal.srt,완료,0,2,0.00,

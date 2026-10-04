@@ -95,12 +95,17 @@ def prepare_model(window) -> None:
 
 
 def test_mode_radio_buttons_are_exclusive_and_switch_panels(window):
+    assert [window.table.horizontalHeaderItem(column).text() for column in range(window.table.columnCount())] == [
+        "원본 자막", "상태", "결과 파일", "검토", "개요", "제거",
+    ]
     assert window.correction_radio.isChecked()
     assert not window.evaluation_radio.isChecked()
     window.evaluation_radio.click()
     assert window.evaluation_radio.isChecked()
     assert not window.correction_radio.isChecked()
     assert window.settings_panel.isHidden()
+    assert window.table.isColumnHidden(4)
+    assert not window.table.isColumnHidden(5)
     assert window.start_button.text() == "평가 시작"
     window.evaluation_radio.click()
     assert window.evaluation_radio.isChecked()
@@ -109,6 +114,7 @@ def test_mode_radio_buttons_are_exclusive_and_switch_panels(window):
     assert not window.evaluation_radio.isChecked()
     assert not window.settings_panel.isHidden()
     assert window.evaluation_table.isHidden()
+    assert not window.table.isColumnHidden(4)
     assert window.start_button.text() == "교정 시작"
 
 
@@ -1477,6 +1483,7 @@ def test_default_state_and_model_selection(window) -> None:
 
 
 def test_worklist_restores_without_closing_original_window(window, app, tmp_path, monkeypatch) -> None:
+    prepare_model(window)
     paths = [tmp_path / name for name in ("review.srt", "running.srt", "waiting.srt")]
     window._files_loaded(paths)
     output = str(tmp_path / "review_revised.srt")
@@ -1496,6 +1503,8 @@ def test_worklist_restores_without_closing_original_window(window, app, tmp_path
         assert restored.table.item(0, 2).toolTip() == output
         assert restored.review_results[paths[0]] == (output, logs)
         assert restored.table.cellWidget(0, 3).isEnabled()
+        assert not restored.table.cellWidget(0, 4).isEnabled()
+        assert paths[0] not in restored.correction_overviews
         assert paths[0] in restored.completed_paths
         assert restored.table.item(1, 1).text() == "대기"
         assert restored.table.item(2, 1).text() == "대기"
@@ -1657,11 +1666,151 @@ def test_drop_folder_and_files_recursively(window, app, tmp_path: Path) -> None:
 
 
 class EchoService(FakeCorrector):
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         super().__init__(echo)
 
     def close(self):
         pass
+
+
+@pytest.mark.parametrize(("outcome", "expected_state"), [
+    ("success", "완료"), ("review", "검토 필요"), ("failure", "실패"), ("cancel", "중단"),
+])
+def test_correction_worker_records_model_and_processing_time(app, tmp_path, monkeypatch, outcome, expected_state):
+    path = tmp_path / "timed.srt"
+    model = ModelInfo("vendor/model", "사용한 모델")
+    initialized = []
+    times = iter([100.0, 182.25])
+
+    class Service(EchoService):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            initialized.append(True)
+
+    def clock():
+        assert initialized
+        return next(times)
+
+    def correct_file(*_args, **_kwargs):
+        if outcome == "failure":
+            raise RuntimeError("교정 실패")
+        if outcome == "cancel":
+            raise gui.CorrectionCancelled()
+        return path.with_stem("timed_revised"), ["검토 내용"] if outcome == "review" else []
+
+    monkeypatch.setattr(gui, "ServiceCorrector", Service)
+    monkeypatch.setattr(gui, "correct_file", correct_file)
+    monkeypatch.setattr(gui, "perf_counter", clock)
+    worker = gui.CorrectionWorker([path], "OpenRouter", "test-secret", model, None)
+    events = []
+    worker.overview_ready.connect(lambda row, overview: events.append(("overview", row, overview)))
+    worker.file_state.connect(lambda row, state, _output: events.append(("state", row, state)))
+    worker.run()
+    overview_events = [event for event in events if event[0] == "overview"]
+    assert len(overview_events) == 1
+    overview_event = overview_events[0]
+    assert overview_event[1] == 0
+    assert overview_event[2] == app_settings.CorrectionOverview(
+        service="OpenRouter", model_id="vendor/model", model_name="사용한 모델", elapsed_seconds=82.25,
+    )
+    assert events.index(overview_event) < events.index(("state", 0, expected_state))
+
+
+def test_correction_overview_dialog_uses_each_files_saved_model_and_time(window, app, tmp_path, monkeypatch):
+    paths = [tmp_path / name for name in ("first.srt", "second.srt")]
+    times = iter([100.0, 3823.25, 4000.0, 4004.5])
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "correct_file", lambda path, *_args, **_kwargs: (path.with_stem(path.stem + "_revised"), []))
+    monkeypatch.setattr(gui, "perf_counter", lambda: next(times))
+    window._files_loaded(paths)
+    assert not window.table.cellWidget(0, 4).isEnabled()
+    prepare_model(window)
+    window._models_loaded([ModelInfo("original-model", "원래 모델")])
+    window.model_combo.setCurrentIndex(0)
+    window.start_correction()
+    finish_work(window, app)
+    first = app_settings.CorrectionOverview(
+        service="OpenAI", model_id="original-model", model_name="원래 모델", elapsed_seconds=3723.25,
+    )
+    assert window.correction_overviews[paths[0]] == first
+    assert window.correction_overviews[paths[1]].elapsed_seconds == 4.5
+    assert window.settings.load_worklist().files[0].overview == first
+    window.service_combo.setCurrentText("OpenRouter")
+    window._models_loaded([ModelInfo("replacement-model", "바꾼 모델")])
+    window.model_combo.setCurrentIndex(0)
+    window.log_view.clear()
+    assert window.table.cellWidget(0, 4).isEnabled()
+    window.table.cellWidget(0, 4).click()
+    dialog = window.findChild(QDialog)
+    assert dialog is not None and dialog.isVisible()
+    assert not dialog.isModal()
+    details = dialog.findChild(QPlainTextEdit)
+    assert details.isReadOnly()
+    text = details.toPlainText()
+    for expected in (str(paths[0]), "완료", "OpenAI", "original-model", "원래 모델", "1시간", "2분", "3.25초"):
+        assert expected in text
+    for unexpected in (str(paths[1]), "replacement-model", "바꾼 모델", "OpenRouter", "test-secret"):
+        assert unexpected not in text
+    dialog.close()
+    restored = gui.MainWindow()
+    try:
+        assert restored.correction_overviews == window.correction_overviews
+        assert restored.table.cellWidget(0, 4).isEnabled()
+        restored.table.cellWidget(1, 4).click()
+        restored_dialog = restored.findChild(QDialog)
+        restored_text = restored_dialog.findChild(QPlainTextEdit).toPlainText()
+        assert str(paths[1]) in restored_text
+        assert "4.50초" in restored_text
+        assert "original-model" in restored_text
+        restored_dialog.close()
+    finally:
+        restored.close()
+        restored.deleteLater()
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("outcome", ["failure", "cancel"])
+def test_correction_retry_replaces_previous_overview(window, app, tmp_path, monkeypatch, outcome):
+    path = tmp_path / "retry.srt"
+    times = iter([100.0, 105.5, 200.0, 202.0])
+    started = Event()
+    release = Event()
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("교정 실패") if outcome == "failure" else gui.CorrectionCancelled()
+
+    def retry(*_args, **_kwargs):
+        started.set()
+        assert release.wait(10)
+        return path.with_stem("retry_revised"), []
+
+    monkeypatch.setattr(gui, "ServiceCorrector", EchoService)
+    monkeypatch.setattr(gui, "perf_counter", lambda: next(times))
+    monkeypatch.setattr(gui, "correct_file", fail)
+    window._files_loaded([path])
+    prepare_model(window)
+    window.start_correction()
+    finish_work(window, app)
+    previous = window.correction_overviews[path]
+    assert previous.model_id == "test-model"
+    assert previous.elapsed_seconds == 5.5
+    assert window.table.cellWidget(0, 4).isEnabled()
+    assert window.settings.load_worklist().files[0].overview == previous
+    window._models_loaded([ModelInfo("retry-model")])
+    window.model_combo.setCurrentIndex(0)
+    monkeypatch.setattr(gui, "correct_file", retry)
+    window.start_correction()
+    try:
+        wait_until(started.is_set)
+        assert path not in window.correction_overviews
+        assert not window.table.cellWidget(0, 4).isEnabled()
+        assert window.settings.load_worklist().files[0].overview is None
+    finally:
+        release.set()
+        finish_work(window, app)
+    assert window.correction_overviews[path].model_id == "retry-model"
+    assert window.correction_overviews[path].elapsed_seconds == 2.0
+    assert window.table.cellWidget(0, 4).isEnabled()
 
 
 def test_gui_correction_flow(window, app, tmp_path, monkeypatch) -> None:
@@ -1710,7 +1859,7 @@ def test_correction_merges_evaluation_reviews_and_restores_them(window, app, tmp
         return response
 
     class Service(EchoService):
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             FakeCorrector.__init__(self, respond)
 
     monkeypatch.setattr(gui, "create_spacer", Spacer)
@@ -1813,7 +1962,7 @@ def test_evaluation_reviews_survive_retry_and_use_latest_evaluation(window, app,
 
 
 @pytest.mark.parametrize("remove", ["clear", "waiting", "selected", "filter"])
-def test_removing_files_discards_evaluation_reviews(window, app, tmp_path, monkeypatch, remove):
+def test_removing_files_discards_evaluation_reviews_and_overviews(window, app, tmp_path, monkeypatch, remove):
     path = tmp_path / "removed.srt"
     monkeypatch.setattr(gui, "create_spacer", object)
     monkeypatch.setattr(gui, "evaluate_file", lambda *_args, **_kwargs: gui.EvaluationResult(
@@ -1824,6 +1973,9 @@ def test_removing_files_discards_evaluation_reviews(window, app, tmp_path, monke
     window.start_evaluation()
     finish_work(window, app)
     assert path in window.evaluation_reviews
+    window._store_overview(path, app_settings.CorrectionOverview(
+        service="OpenAI", model_id="old-model", elapsed_seconds=1.0,
+    ))
     if remove == "clear":
         window.clear_files()
     elif remove == "waiting":
@@ -1836,6 +1988,8 @@ def test_removing_files_discards_evaluation_reviews(window, app, tmp_path, monke
         window.filter_evaluation_results()
     assert not window.paths
     assert not window.evaluation_reviews
+    assert not window.correction_overviews
+    assert window.settings.load_worklist().files == []
 
 
 @pytest.mark.parametrize(("batch_size", "expected_sizes"), [
@@ -1849,7 +2003,7 @@ def test_gui_batch_size_controls_actual_requests(window, app, tmp_path, monkeypa
         return echo(payload)
 
     class Service(EchoService):
-        def __init__(self, *args):
+        def __init__(self, *args, **kwargs):
             FakeCorrector.__init__(self, respond)
 
     monkeypatch.setattr(gui, "ServiceCorrector", Service)
@@ -1883,8 +2037,8 @@ def test_concurrent_correction_limit_refill_and_progress(window, app, tmp_path, 
     peak = 0
 
     class Service(EchoService):
-        def __init__(self, *args):
-            super().__init__(*args)
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
             clients.append(self)
 
         def close(self):
@@ -2022,7 +2176,7 @@ def test_concurrent_queue_add_and_remove(window, app, tmp_path, monkeypatch):
 
 
 def test_correction_initialization_failure_marks_file_and_stops_queue(window, app, tmp_path, monkeypatch):
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise RuntimeError("연결 초기화 실패")
 
     monkeypatch.setattr(gui, "ServiceCorrector", fail)
@@ -2033,6 +2187,9 @@ def test_correction_initialization_failure_marks_file_and_stops_queue(window, ap
     assert window.table.item(0, 1).text() == "실패"
     assert window.table.item(1, 1).text() == "대기"
     assert "실패 1개, 미처리 1개" in window.status_label.text()
+    assert not window.correction_overviews
+    assert not window.table.cellWidget(0, 4).isEnabled()
+    assert not window.table.cellWidget(1, 4).isEnabled()
 
 
 @pytest.mark.parametrize("logs", [[], ["[확인필요] 검토 대상"]])
@@ -2114,7 +2271,7 @@ def test_review_button_shows_only_selected_file_logs(window, app, tmp_path, monk
         assert "test-secret" not in text
         assert "[API KEY]" in text
         assert "test-secret" not in window.settings.worklist_path.read_text(encoding="utf-8")
-        assert not window.table.cellWidget(0, 4).isEnabled()
+        assert not window.table.cellWidget(0, 5).isEnabled()
         window.remove_waiting_file(paths[0])
         assert paths[0] in window.paths
         dialog.close()
@@ -2147,16 +2304,16 @@ def test_remove_waiting_file_during_correction(window, app, tmp_path, monkeypatc
     try:
         assert started.wait(5)
         app.processEvents()
-        assert not window.table.cellWidget(0, 4).isEnabled()
+        assert not window.table.cellWidget(0, 5).isEnabled()
         window.remove_waiting_file(paths[0])
         assert window.paths == paths
-        assert window.table.cellWidget(1, 4).isEnabled()
+        assert window.table.cellWidget(1, 5).isEnabled()
         window.table.selectRow(1)
-        window.table.cellWidget(1, 4).click()
+        window.table.cellWidget(1, 5).click()
         assert window.paths == [paths[0], paths[2]]
         assert window.table.rowCount() == 2
         if remove_all:
-            window.table.cellWidget(1, 4).click()
+            window.table.cellWidget(1, 5).click()
             assert window.paths == paths[:1]
     finally:
         release.set()
@@ -2189,8 +2346,8 @@ def test_fatal_error_summary_includes_previous_completed_files(window, app, tmp_
     assert "저장 1개 (검토 1개), 실패 1개, 미처리 1개" in window.status_label.text()
     assert window.table.cellWidget(0, 3).isEnabled()
     assert not window.table.cellWidget(1, 3).isEnabled()
-    assert not window.table.cellWidget(1, 4).isEnabled()
-    assert window.table.cellWidget(2, 4).isEnabled()
+    assert not window.table.cellWidget(1, 5).isEnabled()
+    assert window.table.cellWidget(2, 5).isEnabled()
 
 
 @pytest.mark.parametrize("stop", [None, "cancel", "auth"])

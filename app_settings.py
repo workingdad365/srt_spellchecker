@@ -45,11 +45,19 @@ class Preferences(BaseModel):
     batch_size: int = Field(default=BATCH_SIZE, ge=1, le=MAX_BATCH_SIZE)
 
 
+class CorrectionOverview(BaseModel):
+    service: str
+    model_id: str
+    model_name: str = ""
+    elapsed_seconds: float = Field(ge=0, allow_inf_nan=False)
+
+
 class SavedWorkFile(BaseModel):
     path: str = Field(min_length=1)
     state: Literal["대기", "교정 중", "완료", "검토 필요", "실패", "중단"] = "대기"
     output: str = ""
     review_logs: list[str] = Field(default_factory=list)
+    overview: CorrectionOverview | None = None
 
 
 class SavedWorklist(BaseModel):

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from ai_services import BASE_URLS, ModelInfo, ServiceCorrector, fetch_models, reasoning_label
-from app_settings import AppSettings, Preferences, SavedModel, SavedWorkFile, SavedWorklist, SettingsError
+from app_settings import AppSettings, CorrectionOverview, Preferences, SavedModel, SavedWorkFile, SavedWorklist, SettingsError
 from spacing_evaluation import EvaluationResult, create_spacer, evaluate_file
 from srt_spellchecker import (
     BATCH_SIZE, DEFAULT_MAX_LINE_LENGTH, FATAL_API_ERRORS, MAX_BATCH_SIZE, CorrectionCancelled,
@@ -68,10 +68,10 @@ class FileTable(QTableWidget):
     paths_dropped = Signal(list)
 
     def __init__(self) -> None:
-        super().__init__(0, 5)
+        super().__init__(0, 6)
         self.setItemDelegate(TableItemDelegate(self))
         self.setMouseTracking(True)
-        self.setHorizontalHeaderLabels(["원본 자막", "상태", "결과 파일", "검토", "제거"])
+        self.setHorizontalHeaderLabels(["원본 자막", "상태", "결과 파일", "검토", "개요", "제거"])
         self.setAcceptDrops(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -83,7 +83,7 @@ class FileTable(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        for column in (3, 4):
+        for column in (3, 4, 5):
             self.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
             self.setColumnWidth(column, 44)
         self.verticalHeader().setDefaultSectionSize(32)
@@ -170,6 +170,7 @@ class CorrectionWorker(QThread):
     log = Signal(str)
     file_state = Signal(int, str, str)
     review_ready = Signal(int, str, list)
+    overview_ready = Signal(int, object)
     progress = Signal(int)
     summary = Signal(str)
 
@@ -197,21 +198,32 @@ class CorrectionWorker(QThread):
         corrector = None
         try:
             check_cancelled(self.isInterruptionRequested)
-            corrector = ServiceCorrector(self.service, self.api_key, self.model)
+            corrector = ServiceCorrector(
+                self.service, self.api_key, self.model, is_cancelled=self.isInterruptionRequested,
+            )
             for index, path in enumerate(self.paths):
                 check_cancelled(self.isInterruptionRequested)
                 self.file_state.emit(index, "교정 중", "")
                 self.write_log(f"[파일] {path}")
                 try:
-                    output, logs = correct_file(
-                        path, corrector, self.wrap_length,
-                        batch_size=self.batch_size,
-                        on_log=self.write_log,
-                        on_progress=lambda done, total, file_index=index: self.progress.emit(
-                            int((file_index + done / total) / len(self.paths) * 1000)
-                        ),
-                        is_cancelled=self.isInterruptionRequested,
-                    )
+                    started = perf_counter()
+                    try:
+                        output, logs = correct_file(
+                            path, corrector, self.wrap_length,
+                            batch_size=self.batch_size,
+                            on_log=self.write_log,
+                            on_progress=lambda done, total, file_index=index: self.progress.emit(
+                                int((file_index + done / total) / len(self.paths) * 1000)
+                            ),
+                            is_cancelled=self.isInterruptionRequested,
+                        )
+                    finally:
+                        self.overview_ready.emit(index, CorrectionOverview(
+                            service=self.service,
+                            model_id=self.model.id,
+                            model_name=self.model.name,
+                            elapsed_seconds=perf_counter() - started,
+                        ))
                     for message in logs:
                         self.write_log(message)
                     if logs:
@@ -368,7 +380,9 @@ class MainWindow(QMainWindow):
             startup_errors.append(str(error))
         self.paths: list[Path] = []
         self.completed_paths: set[Path] = set()
+        self._completed_models: dict[Path, tuple[str, str] | None] = {}
         self.review_results: dict[Path, tuple[str, list[str]]] = {}
+        self.correction_overviews: dict[Path, CorrectionOverview] = {}
         self.evaluation_reviews: dict[Path, tuple[str, ...]] = {}
         self.worker: QThread | None = None
         self._evaluation_recheck_path: Path | None = None
@@ -650,7 +664,7 @@ class MainWindow(QMainWindow):
         self.evaluation_table.setVisible(evaluation)
         self.export_button.setVisible(evaluation)
         self.evaluation_filter_panel.setVisible(evaluation)
-        for column in (1, 2, 3):
+        for column in (1, 2, 3, 4):
             self.table.setColumnHidden(column, evaluation)
         self.start_button.setText("평가 시작" if evaluation else "교정 시작")
         self.progress_bar.setValue(0)
@@ -659,6 +673,7 @@ class MainWindow(QMainWindow):
 
     def _update_controls(self) -> None:
         busy = bool(self.worker or self.file_loader or self._correction_active or self.correction_workers)
+        model = self.selected_model()
         can_add = not self.close_pending and self.worker is None
         self.settings_panel.setEnabled(not busy)
         self.correction_radio.setEnabled(not busy)
@@ -681,8 +696,8 @@ class MainWindow(QMainWindow):
         self.start_button.setEnabled(
             not busy and not self.close_pending and (
                 bool(self.paths) if self.evaluation_radio.isChecked() else
-                any(path not in self.completed_paths for path in self.paths)
-                and bool(self.key_edit.text().strip()) and self.selected_model() is not None
+                any(self._needs_correction(path, model) for path in self.paths)
+                and bool(self.key_edit.text().strip()) and model is not None
             )
         )
         self.cancel_button.setEnabled(any(
@@ -704,10 +719,16 @@ class MainWindow(QMainWindow):
                     and path_item is not None and Path(path_item.toolTip()) in known_paths
                 )
 
+    def _needs_correction(self, path: Path, model: ModelInfo | None) -> bool:
+        if path not in self.completed_paths:
+            return True
+        return model is not None and self._completed_models.get(path) != (self.current_service, model.id)
+
     def _update_row_actions(self, row: int, path: Path) -> None:
         state = self.table.item(row, 1).text()
         self.table.cellWidget(row, 3).setEnabled(state == "검토 필요" and path in self.review_results)
-        self.table.cellWidget(row, 4).setEnabled(
+        self.table.cellWidget(row, 4).setEnabled(path in self.correction_overviews)
+        self.table.cellWidget(row, 5).setEnabled(
             state == "대기" and not self.close_pending
             and self.worker is None
         )
@@ -760,6 +781,8 @@ class MainWindow(QMainWindow):
             path = Path(item.path).resolve()
             if item.review_logs:
                 self._store_review(path, item.output, item.review_logs)
+            if item.overview is not None:
+                self._store_overview(path, item.overview)
             state = "대기" if item.state == "교정 중" else item.state
             self._file_state(self.paths.index(path), state, item.output)
         if self.paths:
@@ -774,6 +797,7 @@ class MainWindow(QMainWindow):
                 state=self.table.item(row, 1).text(),
                 output=self.table.item(row, 2).toolTip(),
                 review_logs=self.review_results.get(path, ("", []))[1],
+                overview=self.correction_overviews.get(path),
             )
             for row, path in enumerate(self.paths)
         ])
@@ -935,10 +959,11 @@ class MainWindow(QMainWindow):
 
     def _files_loaded(self, paths: list[Path]) -> None:
         known = set(self.paths)
+        model = self.selected_model()
         added = 0
         for path in paths:
             path = path.resolve()
-            if path in known or (path in self.completed_paths and self.correction_radio.isChecked()):
+            if path in known or (self.correction_radio.isChecked() and not self._needs_correction(path, model)):
                 continue
             known.add(path)
             self.paths.append(path)
@@ -951,7 +976,8 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 2, QTableWidgetItem(""))
             for column, icon, tooltip, action in (
                 (3, QStyle.StandardPixmap.SP_FileDialogContentsView, "파일별 검토 내역", self.show_review),
-                (4, QStyle.StandardPixmap.SP_TrashIcon, "대기열에서 제거 (원본 파일 유지)", self.remove_waiting_file),
+                (4, QStyle.StandardPixmap.SP_MessageBoxInformation, "LLM 교정 개요", self.show_overview),
+                (5, QStyle.StandardPixmap.SP_TrashIcon, "대기열에서 제거 (원본 파일 유지)", self.remove_waiting_file),
             ):
                 button = QToolButton()
                 button.setIcon(self.style().standardIcon(icon))
@@ -971,6 +997,42 @@ class MainWindow(QMainWindow):
 
     def _store_review(self, path: Path, output: str, logs: list[str]) -> None:
         self.review_results[path] = (output, list(logs))
+
+    def _store_overview(self, path: Path, overview: CorrectionOverview) -> None:
+        self.correction_overviews[path] = overview
+
+    def show_overview(self, path: Path) -> None:
+        overview = self.correction_overviews.get(path)
+        if overview is None or path not in self.paths:
+            return
+        row = self.paths.index(path)
+        hours, remainder = divmod(round(overview.elapsed_seconds, 2), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        elapsed = f"{seconds:.2f}초"
+        if minutes or hours:
+            elapsed = f"{int(minutes)}분 {elapsed}"
+        if hours:
+            elapsed = f"{int(hours)}시간 {elapsed}"
+        model = overview.model_id
+        if overview.model_name and overview.model_name != model:
+            model = f"{overview.model_name} ({model})"
+        dialog = QDialog(self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.setWindowTitle(f"LLM 교정 개요 - {path.name}")
+        dialog.resize(620, 260)
+        layout = QVBoxLayout(dialog)
+        details = QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setPlainText(
+            f"원본: {path}\n"
+            f"결과: {self.table.item(row, 2).toolTip() or '없음'}\n"
+            f"상태: {self.table.item(row, 1).text()}\n"
+            f"서비스: {overview.service}\n"
+            f"모델: {model}\n"
+            f"소요 시간: {elapsed}"
+        )
+        layout.addWidget(details)
+        dialog.show()
 
     def show_review(self, path: Path) -> None:
         result = self.review_results.get(path)
@@ -1007,6 +1069,7 @@ class MainWindow(QMainWindow):
             self._session_paths.remove(path)
         self._attempted_paths.discard(path)
         self.review_results.pop(path, None)
+        self.correction_overviews.pop(path, None)
         self.evaluation_reviews.pop(path, None)
         if self._correction_active:
             self._update_progress()
@@ -1020,6 +1083,7 @@ class MainWindow(QMainWindow):
         rows = sorted({item.row() for item in self.table.selectedItems()}, reverse=True)
         for row in rows:
             self.review_results.pop(self.paths[row], None)
+            self.correction_overviews.pop(self.paths[row], None)
             self.evaluation_reviews.pop(self.paths[row], None)
             del self.paths[row]
             self.table.removeRow(row)
@@ -1031,6 +1095,7 @@ class MainWindow(QMainWindow):
             self.paths.clear()
             self.table.setRowCount(0)
             self.review_results.clear()
+            self.correction_overviews.clear()
             self.evaluation_reviews.clear()
             self.evaluation_table.setRowCount(0)
             self.progress_bar.setValue(0)
@@ -1062,7 +1127,7 @@ class MainWindow(QMainWindow):
             self.start_evaluation()
             return
         model = self.selected_model()
-        paths = [path for path in self.paths if path not in self.completed_paths]
+        paths = [path for path in self.paths if self._needs_correction(path, model)]
         if (
             self.worker is not None or self.file_loader is not None or self._correction_active
             or self.correction_workers
@@ -1284,6 +1349,7 @@ class MainWindow(QMainWindow):
             path = self.paths[row]
             if path not in kept_paths:
                 self.review_results.pop(path, None)
+                self.correction_overviews.pop(path, None)
                 self.evaluation_reviews.pop(path, None)
                 self._attempted_paths.discard(path)
                 self._file_progress.pop(path, None)
@@ -1378,6 +1444,7 @@ class MainWindow(QMainWindow):
         worker.log.connect(lambda message: self.log_view.appendPlainText(f"[{path}] {message}"))
         worker.file_state.connect(lambda _row, state, output: self._file_state(self.paths.index(path), state, output))
         worker.review_ready.connect(lambda _row, output, logs: self._store_review(path, output, logs))
+        worker.overview_ready.connect(lambda _row, overview: self._store_overview(path, overview))
         worker.progress.connect(lambda value: self._update_progress(path, value))
         worker.finished.connect(self._correction_finished)
         worker.start()
@@ -1392,6 +1459,9 @@ class MainWindow(QMainWindow):
         worker = self.sender()
         path = worker.paths[0]
         worker.wait()
+        row = self.paths.index(path)
+        if worker.isInterruptionRequested() and self.table.item(row, 1).text() == "교정 중":
+            self._file_state(row, "중단", "")
         del self.correction_workers[path]
         if worker.aborted and self._correction_active:
             self._stop_corrections("작업 종료")
@@ -1424,6 +1494,8 @@ class MainWindow(QMainWindow):
 
     def _file_state(self, row: int, state: str, output: str) -> None:
         path = self.paths[row]
+        if state in {"대기", "교정 중"}:
+            self.correction_overviews.pop(path, None)
         if state in {"완료", "검토 필요"}:
             logs = list(dict.fromkeys([
                 *self.evaluation_reviews.get(path, ()),
@@ -1437,7 +1509,16 @@ class MainWindow(QMainWindow):
         self.table.item(row, 2).setText(str(Path(output_path.parent.name) / output_path.name) if output else "")
         self.table.item(row, 2).setToolTip(output)
         if state in {"완료", "검토 필요"}:
-            self.completed_paths.add(self.paths[row])
+            self.completed_paths.add(path)
+            overview = self.correction_overviews.get(path)
+            model = self.selected_model()
+            self._completed_models[path] = (
+                (overview.service, overview.model_id) if overview is not None
+                else (self.current_service, model.id) if model is not None else None
+            )
+        else:
+            self.completed_paths.discard(path)
+            self._completed_models.pop(path, None)
         self.table.set_row_active(row, state == "교정 중")
         self._update_row_actions(row, self.paths[row])
         self._save_worklist()
@@ -1464,7 +1545,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText(
                 "중단 요청됨: 진행 중인 분석 종료 대기" if isinstance(self.worker, EvaluationWorker)
                 else "중단 요청됨: 파일 탐색 종료 대기" if self.worker is None and not self.correction_workers
-                else "중단 요청됨: 진행 중인 API 요청 종료 대기"
+                else "중단 요청됨: 진행 중인 API 요청 취소 중" if self.correction_workers
+                else "중단 요청됨: 모델 조회 종료 대기"
             )
             self._update_controls()
 

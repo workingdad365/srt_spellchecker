@@ -1,0 +1,4 @@
+﻿평가 자막,평가 상태,띄어쓰기 오류 수,글자 수,"1,000자당 오류 수",검토
+test_partial_evaluation_status0\partial.srt,부분 평가 (1줄 제외),1,5,200.00,
+test_partial_evaluation_status0\normal.srt,완료,0,5,0.00,
+test_partial_evaluation_status0\unscorable.srt,평가 불가 (1줄 제외),—,—,—,

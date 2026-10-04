@@ -34,6 +34,14 @@ def mock_client(monkeypatch, handler) -> None:
             http_client=httpx.Client(transport=httpx.MockTransport(handler)),
         ),
     )
+    monkeypatch.setattr(
+        services,
+        "create_async_client",
+        lambda *args: openai.AsyncOpenAI(
+            api_key="test-key", base_url="https://example.test/v1", max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        ),
+    )
 
 
 def test_fetch_models_preserves_metadata(monkeypatch) -> None:

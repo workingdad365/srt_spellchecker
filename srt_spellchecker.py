@@ -354,6 +354,8 @@ def correct_batch_with_retry(
         check_cancelled(is_cancelled)
         try:
             return request_corrections(corrector, payload, wrap_length)
+        except CorrectionCancelled:
+            raise
         except FATAL_API_ERRORS:
             raise
         except Exception as error:
