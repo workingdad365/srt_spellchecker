@@ -5,6 +5,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import quote
 
 import openai
 
@@ -22,6 +23,21 @@ class ModelInfo:
     id: str
     name: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProviderInfo:
+    id: str
+    name: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def openrouter_base_model_id(model_id: str) -> str:
+    model_id = model_id.strip()
+    base_id, separator, variant = model_id.rpartition(":")
+    if separator and variant in {"nitro", "floor"}:
+        return base_id
+    return model_id
 
 
 def _client_options(service: str, api_key: str) -> dict[str, Any]:
@@ -57,6 +73,37 @@ def fetch_models(service: str, api_key: str) -> list[ModelInfo]:
                 continue
             result[model.id] = ModelInfo(model.id, metadata.get("name") or model.id, metadata)
     return sorted(result.values(), key=lambda model: model.id.casefold())
+
+
+def fetch_providers(service: str, api_key: str, model: ModelInfo) -> list[ProviderInfo]:
+    if service == "OpenAI":
+        return []
+    if service != "OpenRouter":
+        raise ValueError(f"지원하지 않는 서비스: {service}")
+    model_id = openrouter_base_model_id(model.id)
+    author, separator, slug = model_id.partition("/")
+    if not separator or not author or not slug or author in {".", ".."} or slug in {".", ".."}:
+        raise ValueError("OpenRouter 모델 ID는 작성자/모델 형식이어야 합니다.")
+    path = f"/models/{quote(author, safe='')}/{quote(slug, safe='')}/endpoints"
+    with create_client(service, api_key) as client:
+        payload = client.with_options(timeout=30).get(path, cast_to=dict)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    endpoints = data.get("endpoints") if isinstance(data, dict) else None
+    if not isinstance(endpoints, list):
+        raise ValueError("OpenRouter 응답에 프로바이더 목록이 없습니다.")
+    result = {}
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        provider_id = endpoint.get("tag")
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            continue
+        provider_id = provider_id.strip()
+        name = endpoint.get("provider_name")
+        if not isinstance(name, str) or not name.strip():
+            name = provider_id
+        result.setdefault(provider_id, ProviderInfo(provider_id, name.strip(), endpoint))
+    return sorted(result.values(), key=lambda provider: (provider.name.casefold(), provider.id.casefold()))
 
 
 def minimum_reasoning(model: ModelInfo) -> dict[str, Any]:
@@ -97,11 +144,12 @@ def correction_schema() -> dict[str, Any]:
 class ServiceCorrector:
     def __init__(
         self, service: str, api_key: str, model: ModelInfo,
-        *, is_cancelled: Callable[[], bool] | None = None,
+        *, is_cancelled: Callable[[], bool] | None = None, provider: str = "",
     ) -> None:
         self.client = create_async_client(service, api_key)
         self.service = service
         self.model = model
+        self.provider = provider.strip()
         self.is_cancelled = is_cancelled
         self._runner = asyncio.Runner()
         self._closed = False
@@ -151,8 +199,13 @@ class ServiceCorrector:
         )
         if self.service == "OpenRouter":
             policy = minimum_reasoning(self.model)
+            extra_body = {}
             if policy:
-                request["extra_body"] = {"reasoning": policy}
+                extra_body["reasoning"] = policy
+            if self.provider:
+                extra_body["provider"] = {"only": [self.provider], "allow_fallbacks": False}
+            if extra_body:
+                request["extra_body"] = extra_body
         response = self._runner.run(self._request(request))
         if not response.choices:
             raise ValueError("모델 응답에 교정 결과가 없습니다.")

@@ -8,7 +8,7 @@ from keyring.backend import KeyringBackend
 from pydantic import BaseModel, Field, ValidationError
 from PySide6.QtCore import QIODevice, QSaveFile, QSettings, QStandardPaths
 
-from ai_services import ModelInfo
+from ai_services import ModelInfo, ProviderInfo
 from srt_spellchecker import BATCH_SIZE, DEFAULT_MAX_LINE_LENGTH, MAX_BATCH_SIZE
 
 
@@ -36,9 +36,27 @@ class SavedModel(BaseModel):
         return ModelInfo(self.id, self.name, self.metadata)
 
 
+class SavedProvider(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = ""
+    supported_parameters: list[str] | None = None
+
+    @classmethod
+    def from_provider(cls, provider: ProviderInfo) -> SavedProvider:
+        return cls(
+            id=provider.id, name=provider.name,
+            supported_parameters=provider.metadata.get("supported_parameters"),
+        )
+
+    def to_provider(self) -> ProviderInfo:
+        metadata = {} if self.supported_parameters is None else {"supported_parameters": self.supported_parameters}
+        return ProviderInfo(self.id, self.name, metadata)
+
+
 class Preferences(BaseModel):
     service: Literal["OpenAI", "OpenRouter"] = "OpenAI"
     models: dict[str, SavedModel] = Field(default_factory=dict)
+    openrouter_providers: dict[str, SavedProvider] = Field(default_factory=dict)
     wrap: bool = False
     max_line_length: int = Field(default=DEFAULT_MAX_LINE_LENGTH, ge=1, le=200)
     concurrent_files: int = Field(default=1, ge=1, le=32)
@@ -49,6 +67,8 @@ class CorrectionOverview(BaseModel):
     service: str
     model_id: str
     model_name: str = ""
+    provider_id: str = ""
+    provider_name: str = ""
     elapsed_seconds: float = Field(ge=0, allow_inf_nan=False)
 
 

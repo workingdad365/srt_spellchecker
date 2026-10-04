@@ -19,8 +19,13 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from ai_services import BASE_URLS, ModelInfo, ServiceCorrector, fetch_models, reasoning_label
-from app_settings import AppSettings, CorrectionOverview, Preferences, SavedModel, SavedWorkFile, SavedWorklist, SettingsError
+from ai_services import (
+    BASE_URLS, ModelInfo, ProviderInfo, ServiceCorrector, fetch_models, fetch_providers,
+    openrouter_base_model_id, reasoning_label,
+)
+from app_settings import (
+    AppSettings, CorrectionOverview, Preferences, SavedModel, SavedProvider, SavedWorkFile, SavedWorklist, SettingsError,
+)
 from spacing_evaluation import EvaluationResult, create_spacer, evaluate_file
 from srt_spellchecker import (
     BATCH_SIZE, DEFAULT_MAX_LINE_LENGTH, FATAL_API_ERRORS, MAX_BATCH_SIZE, CorrectionCancelled,
@@ -177,13 +182,14 @@ class CorrectionWorker(QThread):
     def __init__(
         self, paths: list[Path], service: str, api_key: str, model: ModelInfo,
         wrap_length: int | None, parent: QWidget | None = None,
-        *, batch_size: int = BATCH_SIZE,
+        *, batch_size: int = BATCH_SIZE, provider: ProviderInfo | None = None,
     ) -> None:
         super().__init__(parent)
         self.paths = list(paths)
         self.service = service
         self.api_key = api_key
         self.model = model
+        self.provider = provider if service == "OpenRouter" else None
         self.wrap_length = wrap_length
         self.batch_size = batch_size
         self.aborted = False
@@ -198,8 +204,14 @@ class CorrectionWorker(QThread):
         corrector = None
         try:
             check_cancelled(self.isInterruptionRequested)
+            model = self.model
+            if self.provider is not None and isinstance(self.provider.metadata.get("supported_parameters"), list):
+                model = ModelInfo(model.id, model.name, {
+                    **model.metadata, "supported_parameters": self.provider.metadata["supported_parameters"],
+                })
             corrector = ServiceCorrector(
-                self.service, self.api_key, self.model, is_cancelled=self.isInterruptionRequested,
+                self.service, self.api_key, model, is_cancelled=self.isInterruptionRequested,
+                provider=self.provider.id if self.provider else "",
             )
             for index, path in enumerate(self.paths):
                 check_cancelled(self.isInterruptionRequested)
@@ -222,6 +234,8 @@ class CorrectionWorker(QThread):
                             service=self.service,
                             model_id=self.model.id,
                             model_name=self.model.name,
+                            provider_id=self.provider.id if self.provider else "",
+                            provider_name=self.provider.name if self.provider else "",
                             elapsed_seconds=perf_counter() - started,
                         ))
                     for message in logs:
@@ -380,7 +394,13 @@ class MainWindow(QMainWindow):
             startup_errors.append(str(error))
         self.paths: list[Path] = []
         self.completed_paths: set[Path] = set()
-        self._completed_models: dict[Path, tuple[str, str] | None] = {}
+        self._completed_models: dict[Path, tuple[str, str, str] | None] = {}
+        self._provider_cache: dict[str, list[ProviderInfo]] = {}
+        self._provider_refresh_enabled = False
+        self._provider_timer = QTimer(self)
+        self._provider_timer.setSingleShot(True)
+        self._provider_timer.setInterval(300)
+        self._provider_timer.timeout.connect(self._load_providers)
         self.review_results: dict[Path, tuple[str, list[str]]] = {}
         self.correction_overviews: dict[Path, CorrectionOverview] = {}
         self.evaluation_reviews: dict[Path, tuple[str, ...]] = {}
@@ -432,6 +452,7 @@ class MainWindow(QMainWindow):
             startup_errors.append(str(error))
         self._restoring = False
         self._model_changed()
+        self._provider_refresh_enabled = True
         for message in startup_errors:
             self.show_error(message)
 
@@ -501,6 +522,19 @@ class MainWindow(QMainWindow):
         model_row.addWidget(self.model_combo, 1)
         model_row.addWidget(self.fetch_button)
         form.addRow("모델", model_row)
+        self.provider_label = QLabel("프로바이더")
+        self.provider_combo = QComboBox()
+        self.provider_combo.setEditable(True)
+        self.provider_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.provider_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.provider_combo.setMinimumContentsLength(18)
+        self.provider_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.provider_combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        self.provider_combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.provider_combo.addItem("자동 선택", None)
+        self.provider_combo.setToolTip("선택한 모델을 제공하는 프로바이더. 지정하면 해당 프로바이더만 사용")
+        self.provider_combo.currentTextChanged.connect(self._provider_changed)
+        form.addRow(self.provider_label, self.provider_combo)
         self.reasoning_note = QLabel("미선택")
         self.reasoning_note.setWordWrap(True)
         form.addRow("추론", self.reasoning_note)
@@ -653,11 +687,36 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
     def selected_model(self) -> ModelInfo | None:
-        index = self.model_combo.findText(self.model_combo.currentText())
-        return self.model_combo.itemData(index) if index >= 0 else None
+        return self._model_for_id(self.model_combo.currentText().strip())
+
+    def _model_for_id(self, model_id: str) -> ModelInfo | None:
+        index = self.model_combo.findText(model_id)
+        if index >= 0:
+            return self.model_combo.itemData(index)
+        if self.current_service == "OpenRouter" and model_id:
+            base_id = openrouter_base_model_id(model_id)
+            for index in range(self.model_combo.count()):
+                model = self.model_combo.itemData(index)
+                if model is not None and openrouter_base_model_id(model.id) == base_id:
+                    return ModelInfo(model_id, model.name, dict(model.metadata))
+        return None
+
+    def selected_provider(self) -> ProviderInfo | None:
+        if self.current_service != "OpenRouter":
+            return None
+        index = self.provider_combo.findText(self.provider_combo.currentText())
+        return self.provider_combo.itemData(index) if index >= 0 else None
+
+    def _provider_selection_valid(self) -> bool:
+        if self.current_service != "OpenRouter":
+            return True
+        index = self.provider_combo.findText(self.provider_combo.currentText())
+        return index >= 0 and self.provider_combo.itemData(index, Qt.ItemDataRole.UserRole + 1) is not False
 
     def _mode_changed(self) -> None:
         evaluation = self.evaluation_radio.isChecked()
+        if evaluation:
+            self._provider_timer.stop()
         self.settings_panel.setVisible(not evaluation)
         self.wrap_check.setVisible(not evaluation)
         self.length_spin.setVisible(not evaluation)
@@ -670,6 +729,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.status_label.setText("간이평가 대기" if evaluation else "교정 대기")
         self._update_controls()
+        if not evaluation:
+            self._schedule_provider_lookup()
 
     def _update_controls(self) -> None:
         busy = bool(self.worker or self.file_loader or self._correction_active or self.correction_workers)
@@ -680,6 +741,7 @@ class MainWindow(QMainWindow):
         self.evaluation_radio.setEnabled(not busy)
         self.fetch_button.setEnabled(not busy and bool(self.key_edit.text().strip()))
         self.model_combo.setEnabled(not busy and self.model_combo.count() > 0)
+        self.provider_combo.setEnabled(not busy and model is not None and self.provider_combo.count() > 1)
         for widget in (self.files_button, self.folder_button, self.table):
             widget.setEnabled(can_add)
         self.wrap_check.setEnabled(not busy)
@@ -698,6 +760,7 @@ class MainWindow(QMainWindow):
                 bool(self.paths) if self.evaluation_radio.isChecked() else
                 any(self._needs_correction(path, model) for path in self.paths)
                 and bool(self.key_edit.text().strip()) and model is not None
+                and self._provider_selection_valid()
             )
         )
         self.cancel_button.setEnabled(any(
@@ -722,7 +785,10 @@ class MainWindow(QMainWindow):
     def _needs_correction(self, path: Path, model: ModelInfo | None) -> bool:
         if path not in self.completed_paths:
             return True
-        return model is not None and self._completed_models.get(path) != (self.current_service, model.id)
+        provider = self.selected_provider()
+        return model is not None and self._completed_models.get(path) != (
+            self.current_service, model.id, provider.id if provider else "",
+        )
 
     def _update_row_actions(self, row: int, path: Path) -> None:
         state = self.table.item(row, 1).text()
@@ -737,6 +803,7 @@ class MainWindow(QMainWindow):
         if self._restoring:
             return
         self._save_current_key()
+        self._provider_timer.stop()
         self._restoring = True
         self.current_service = service
         self.preferences.service = "OpenRouter" if service == "OpenRouter" else "OpenAI"
@@ -751,6 +818,9 @@ class MainWindow(QMainWindow):
         if self._restoring:
             return
         self.keys[self.current_service] = self.key_edit.text().strip()
+        self._provider_timer.stop()
+        if self.current_service == "OpenRouter":
+            self._provider_cache.clear()
         self.model_combo.clear()
         self._model_changed()
         self.key_save_timer.start()
@@ -759,11 +829,24 @@ class MainWindow(QMainWindow):
         if self._restoring:
             return
         model = self.selected_model()
+        self._refresh_provider_options()
         self.reasoning_note.setText(reasoning_label(self.current_service, model) if model else "미선택")
         if model is not None:
             self.preferences.models[self.current_service] = SavedModel.from_model(model)
             self._save_preferences()
         self._update_controls()
+        self._schedule_provider_lookup()
+
+    def _schedule_provider_lookup(self) -> None:
+        self._provider_timer.stop()
+        model = self.selected_model()
+        if (
+            self._provider_refresh_enabled and not self.close_pending
+            and self.current_service == "OpenRouter"
+            and model is not None and not self.evaluation_radio.isChecked()
+            and openrouter_base_model_id(model.id) not in self._provider_cache
+        ):
+            self._provider_timer.start()
 
     def _restore_model(self) -> None:
         self.model_combo.blockSignals(True)
@@ -865,6 +948,85 @@ class MainWindow(QMainWindow):
         if self.close_pending and self.file_loader is None and not self.correction_workers:
             QTimer.singleShot(0, self.close)
 
+    def _refresh_provider_options(self) -> None:
+        router = self.current_service == "OpenRouter"
+        self.provider_label.setVisible(router)
+        self.provider_combo.setVisible(router)
+        model = self.selected_model()
+        base_id = openrouter_base_model_id(model.id) if router and model else ""
+        saved = self.preferences.openrouter_providers.get(base_id)
+        providers = self._provider_cache.get(base_id, [])
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.clear()
+        self.provider_combo.addItem("자동 선택", None)
+        selected = 0
+        for provider in providers:
+            self.provider_combo.addItem(f"{provider.name or provider.id} ({provider.id})", provider)
+            if saved is not None and provider.id == saved.id:
+                selected = self.provider_combo.count() - 1
+        if saved is not None and selected == 0:
+            unavailable = base_id in self._provider_cache
+            label = f"{saved.name or saved.id} ({saved.id})" + (" - 현재 목록에 없음" if unavailable else "")
+            self.provider_combo.addItem(label, saved.to_provider())
+            selected = self.provider_combo.count() - 1
+            if unavailable:
+                self.provider_combo.setItemData(selected, False, Qt.ItemDataRole.UserRole + 1)
+                self.provider_combo.setItemData(
+                    selected, "이 모델의 프로바이더 목록에서 찾지 못했습니다. 다른 항목을 선택하세요.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+        self.provider_combo.setCurrentIndex(selected)
+        self.provider_combo.blockSignals(False)
+
+    def _provider_changed(self) -> None:
+        if self._restoring:
+            return
+        model = self.selected_model()
+        if self.current_service == "OpenRouter" and model is not None and self._provider_selection_valid():
+            base_id = openrouter_base_model_id(model.id)
+            provider = self.selected_provider()
+            if provider is None:
+                self.preferences.openrouter_providers.pop(base_id, None)
+            else:
+                self.preferences.openrouter_providers[base_id] = SavedProvider.from_provider(provider)
+            self._save_preferences()
+        self._update_controls()
+
+    def _load_providers(self) -> None:
+        self._provider_timer.stop()
+        model = self.selected_model()
+        if (
+            self.close_pending or self._restoring or self.current_service != "OpenRouter"
+            or self.evaluation_radio.isChecked() or model is None or not self.key_edit.text().strip()
+            or self._correction_active or self.correction_workers
+            or openrouter_base_model_id(model.id) in self._provider_cache
+        ):
+            return
+        if self.worker is not None or self.file_loader is not None:
+            self._provider_timer.start()
+            return
+        service, api_key = self.current_service, self.key_edit.text().strip()
+        worker = BackgroundTask(lambda: fetch_providers(service, api_key, model), self)
+        worker.result.connect(lambda providers: self._providers_loaded(service, api_key, model.id, providers))
+        worker.failed.connect(lambda message: self.show_error(message.replace(api_key, "[API KEY]")))
+        self._start_worker(worker, "프로바이더 목록 조회 중")
+
+    def _providers_loaded(self, service: str, api_key: str, model_id: str, providers: list[ProviderInfo]) -> None:
+        model = self.selected_model()
+        if (
+            self.close_pending or service != self.current_service or api_key != self.key_edit.text().strip()
+            or model is None or openrouter_base_model_id(model.id) != openrouter_base_model_id(model_id)
+        ):
+            return
+        base_id = openrouter_base_model_id(model_id)
+        self._provider_cache[base_id] = list(providers)
+        self._refresh_provider_options()
+        self._provider_changed()
+        self.status_label.setText(
+            f"프로바이더 {len(providers)}개" if self._provider_selection_valid()
+            else "저장된 프로바이더가 현재 목록에 없습니다. 다른 항목을 선택하세요."
+        )
+
     def show_error(self, message: str) -> None:
         for key in [self.key_edit.text().strip(), *self.keys.values()]:
             if key:
@@ -877,6 +1039,9 @@ class MainWindow(QMainWindow):
             return
         self._save_current_key()
         service, api_key = self.current_service, self.key_edit.text().strip()
+        self._provider_timer.stop()
+        if service == "OpenRouter":
+            self._provider_cache.clear()
         self.model_combo.clear()
         worker = BackgroundTask(lambda: fetch_models(service, api_key), self)
         worker.result.connect(self._models_loaded)
@@ -894,8 +1059,10 @@ class MainWindow(QMainWindow):
             )
         selected = self.model_combo.findText(previous.id) if previous is not None else -1
         self.model_combo.setCurrentIndex(selected)
+        if previous is not None and selected < 0 and self._model_for_id(previous.id) is not None:
+            self.model_combo.setEditText(previous.id)
         self.model_combo.blockSignals(False)
-        if previous is not None and selected < 0:
+        if previous is not None and self.selected_model() is None:
             self.preferences.models.pop(self.current_service, None)
             self._save_preferences()
         self._model_changed()
@@ -1016,6 +1183,10 @@ class MainWindow(QMainWindow):
         model = overview.model_id
         if overview.model_name and overview.model_name != model:
             model = f"{overview.model_name} ({model})"
+        provider = overview.provider_id or "자동 선택"
+        if overview.provider_name and overview.provider_name != overview.provider_id:
+            provider = f"{overview.provider_name} ({overview.provider_id})"
+        provider_details = f"프로바이더 설정: {provider}\n" if overview.service == "OpenRouter" else ""
         dialog = QDialog(self)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.setWindowTitle(f"LLM 교정 개요 - {path.name}")
@@ -1029,6 +1200,7 @@ class MainWindow(QMainWindow):
             f"상태: {self.table.item(row, 1).text()}\n"
             f"서비스: {overview.service}\n"
             f"모델: {model}\n"
+            f"{provider_details}"
             f"소요 시간: {elapsed}"
         )
         layout.addWidget(details)
@@ -1132,9 +1304,11 @@ class MainWindow(QMainWindow):
             self.worker is not None or self.file_loader is not None or self._correction_active
             or self.correction_workers
             or not paths or model is None or not self.key_edit.text().strip()
+            or not self._provider_selection_valid()
         ):
             return
         self._save_current_key()
+        self._provider_timer.stop()
         self._correction_active = True
         self._session_paths = paths
         self._attempted_paths.clear()
@@ -1145,6 +1319,9 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.log_view.clear()
         self.log_view.appendPlainText(f"[모델] {self.current_service} / {model.id}")
+        if self.current_service == "OpenRouter":
+            provider = self.selected_provider()
+            self.log_view.appendPlainText(f"[프로바이더] {provider.id if provider else '자동 선택'}")
         self.log_view.appendPlainText(f"[추론] {reasoning_label(self.current_service, model)}")
         self.log_view.appendPlainText(f"[동시 교정] 최대 {self.concurrency_spin.value()}개 파일")
         self.log_view.appendPlainText(f"[배치 크기] 요청당 자막 {self.batch_size_spin.value()}개")
@@ -1439,6 +1616,7 @@ class MainWindow(QMainWindow):
             [path], self.current_service, self.key_edit.text().strip(), model,
             self.length_spin.value() if self.wrap_check.isChecked() else None, self,
             batch_size=self.batch_size_spin.value(),
+            provider=self.selected_provider(),
         )
         self.correction_workers[path] = worker
         worker.log.connect(lambda message: self.log_view.appendPlainText(f"[{path}] {message}"))
@@ -1512,9 +1690,10 @@ class MainWindow(QMainWindow):
             self.completed_paths.add(path)
             overview = self.correction_overviews.get(path)
             model = self.selected_model()
+            provider = self.selected_provider()
             self._completed_models[path] = (
-                (overview.service, overview.model_id) if overview is not None
-                else (self.current_service, model.id) if model is not None else None
+                (overview.service, overview.model_id, overview.provider_id) if overview is not None
+                else (self.current_service, model.id, provider.id if provider else "") if model is not None else None
             )
         else:
             self.completed_paths.discard(path)
@@ -1528,6 +1707,7 @@ class MainWindow(QMainWindow):
         self.log_view.appendPlainText(message)
 
     def cancel_work(self) -> None:
+        self._provider_timer.stop()
         self._stop_corrections("중단")
         self._file_requests.clear()
         if self._evaluation_prepare_timer.isActive():
@@ -1546,7 +1726,7 @@ class MainWindow(QMainWindow):
                 "중단 요청됨: 진행 중인 분석 종료 대기" if isinstance(self.worker, EvaluationWorker)
                 else "중단 요청됨: 파일 탐색 종료 대기" if self.worker is None and not self.correction_workers
                 else "중단 요청됨: 진행 중인 API 요청 취소 중" if self.correction_workers
-                else "중단 요청됨: 모델 조회 종료 대기"
+                else "중단 요청됨: 목록 조회 종료 대기"
             )
             self._update_controls()
 
@@ -1559,6 +1739,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._save_current_key()
+        self._provider_timer.stop()
         self._save_preferences()
         self.key_save_timer.stop()
         self._restoring = True

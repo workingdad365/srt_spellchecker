@@ -39,6 +39,7 @@ def app():
 
 @pytest.fixture(autouse=True)
 def isolated_settings(tmp_path, monkeypatch):
+    monkeypatch.setattr(gui, "fetch_providers", lambda *_args: [])
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     credentials = MemoryCredentials()
@@ -2587,7 +2588,9 @@ def test_cancel_inflight_request_keeps_source_and_next_file(window, app, tmp_pat
 
 
 @pytest.mark.parametrize(("width", "height"), [(720, 620), (980, 800)])
-def test_layout_fits_window(window, app, width, height) -> None:
+@pytest.mark.parametrize("service", ["OpenAI", "OpenRouter"])
+def test_layout_fits_window(window, app, width, height, service) -> None:
+    window.service_combo.setCurrentText(service)
     window._files_loaded([Path("layout.srt")])
     window.resize(width, height)
     window.show()

@@ -113,3 +113,139 @@ def test_openrouter_output_format_follows_metadata(monkeypatch, parameters, form
         assert corrector.invoke([("system", "Correct JSON"), ("human", "text")])["parsed"].items == []
     finally:
         corrector.close()
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("openai/gpt-oss-120b:nitro", "openai/gpt-oss-120b"),
+        ("openai/gpt-oss-120b:floor", "openai/gpt-oss-120b"),
+        ("vendor/model:free", "vendor/model:free"),
+        ("vendor/model:thinking", "vendor/model:thinking"),
+        ("vendor/model:free:nitro", "vendor/model:free"),
+        ("vendor/model:nitro-preview", "vendor/model:nitro-preview"),
+        (" vendor/model ", "vendor/model"),
+        ("vendor/model", "vendor/model"),
+    ],
+)
+def test_openrouter_base_model_id_preserves_non_routing_variants(model_id, expected) -> None:
+    assert services.openrouter_base_model_id(model_id) == expected
+
+
+@pytest.mark.parametrize("suffix", ["", ":nitro", ":floor"])
+def test_fetch_providers_preserves_endpoint_tags_and_metadata(monkeypatch, suffix) -> None:
+    endpoints = [
+        {"tag": "z-provider", "provider_name": "Z Provider"},
+        {
+            "tag": "deepinfra/turbo", "provider_name": "DeepInfra",
+            "supported_parameters": ["response_format"], "quantization": "bf16",
+        },
+        {"tag": "deepinfra/bf16", "provider_name": "DeepInfra"},
+        {"tag": "deepinfra/turbo", "provider_name": "DeepInfra"},
+        {"tag": "fallback-name"},
+        {"tag": "", "provider_name": "Missing tag"},
+        {"provider_name": "Missing tag"},
+        None,
+    ]
+
+    def handler(request):
+        assert request.url.path == "/v1/models/openai/gpt-oss-120b/endpoints"
+        return httpx.Response(200, json={"data": {"endpoints": endpoints}})
+
+    mock_client(monkeypatch, handler)
+    providers = services.fetch_providers(
+        "OpenRouter", "test-key", services.ModelInfo("openai/gpt-oss-120b" + suffix),
+    )
+    assert [provider.id for provider in providers] == [
+        "deepinfra/bf16", "deepinfra/turbo", "fallback-name", "z-provider",
+    ]
+    assert providers[1].metadata == endpoints[1]
+    assert providers[2].name == "fallback-name"
+
+
+def test_fetch_providers_encodes_model_id_in_path(monkeypatch) -> None:
+    def handler(request):
+        assert request.url.raw_path == b"/v1/models/vendor/model%3Afree%3Fquery%3Dvalue%23fragment/endpoints"
+        assert request.url.query == b""
+        return httpx.Response(200, json={"data": {"endpoints": []}})
+
+    mock_client(monkeypatch, handler)
+    assert services.fetch_providers(
+        "OpenRouter", "test-key", services.ModelInfo("vendor/model:free?query=value#fragment"),
+    ) == []
+
+
+def test_fetch_providers_skips_openai_without_request(monkeypatch) -> None:
+    def unexpected_client(*_args):
+        pytest.fail("OpenAI는 프로바이더를 조회하지 않아야 합니다.")
+
+    monkeypatch.setattr(services, "create_client", unexpected_client)
+    assert services.fetch_providers("OpenAI", "", services.ModelInfo("gpt-test")) == []
+
+
+@pytest.mark.parametrize("payload", [{}, {"data": None}, {"data": {"endpoints": None}}])
+def test_fetch_providers_rejects_invalid_catalog(monkeypatch, payload) -> None:
+    mock_client(monkeypatch, lambda _request: httpx.Response(200, json=payload))
+    with pytest.raises(ValueError, match="프로바이더 목록"):
+        services.fetch_providers("OpenRouter", "test-key", services.ModelInfo("vendor/model"))
+
+
+@pytest.mark.parametrize("model_id", ["", "model", "/model", "vendor/", "../model", "vendor/.."])
+def test_fetch_providers_rejects_invalid_model_id_without_request(monkeypatch, model_id) -> None:
+    def unexpected_client(*_args):
+        pytest.fail("잘못된 모델 ID로 요청을 보내면 안 됩니다.")
+
+    monkeypatch.setattr(services, "create_client", unexpected_client)
+    with pytest.raises(ValueError, match="작성자/모델"):
+        services.fetch_providers("OpenRouter", "test-key", services.ModelInfo(model_id))
+
+
+def test_fetch_providers_propagates_api_failure(monkeypatch) -> None:
+    mock_client(monkeypatch, lambda _request: httpx.Response(
+        503, json={"error": {"message": "Unavailable", "code": 503}},
+    ))
+    with pytest.raises(openai.APIStatusError):
+        services.fetch_providers("OpenRouter", "test-key", services.ModelInfo("vendor/model"))
+
+
+@pytest.mark.parametrize("reasoning", [None, {"mandatory": False}])
+def test_openrouter_corrector_pins_provider_and_preserves_model_suffix(monkeypatch, reasoning) -> None:
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["model"] == "openai/gpt-oss-120b:nitro"
+        assert body["provider"] == {"only": ["deepinfra/turbo"], "allow_fallbacks": False}
+        if reasoning is None:
+            assert "reasoning" not in body
+        else:
+            assert body["reasoning"] == {"enabled": False, "exclude": True}
+        return httpx.Response(200, json={"choices": [{
+            "finish_reason": "stop", "index": 0,
+            "message": {"role": "assistant", "content": '{"items":[]}'},
+        }]})
+
+    mock_client(monkeypatch, handler)
+    model = services.ModelInfo("openai/gpt-oss-120b:nitro", metadata={"reasoning": reasoning})
+    corrector = services.ServiceCorrector("OpenRouter", "key", model, provider=" deepinfra/turbo ")
+    try:
+        assert corrector.invoke([("system", "Correct JSON"), ("human", "text")])["parsed"].items == []
+    finally:
+        corrector.close()
+
+
+@pytest.mark.parametrize(
+    ("service", "provider"), [("OpenAI", "deepinfra/turbo"), ("OpenRouter", "")],
+)
+def test_corrector_omits_provider_for_openai_or_automatic_routing(monkeypatch, service, provider) -> None:
+    def handler(request):
+        assert "provider" not in json.loads(request.content)
+        return httpx.Response(200, json={"choices": [{
+            "finish_reason": "stop", "index": 0,
+            "message": {"role": "assistant", "content": '{"items":[]}'},
+        }]})
+
+    mock_client(monkeypatch, handler)
+    corrector = services.ServiceCorrector(service, "key", services.ModelInfo("model"), provider=provider)
+    try:
+        assert corrector.invoke([("system", "Correct JSON"), ("human", "text")])["parsed"].items == []
+    finally:
+        corrector.close()
