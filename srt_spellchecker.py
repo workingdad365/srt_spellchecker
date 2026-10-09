@@ -14,6 +14,7 @@ from time import monotonic, sleep
 from pathlib import Path
 from typing import Any
 
+import anthropic
 import openai
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,10 @@ FATAL_API_ERRORS = (
     openai.PermissionDeniedError,
     openai.BadRequestError,
     openai.NotFoundError,
+    anthropic.AuthenticationError,
+    anthropic.PermissionDeniedError,
+    anthropic.BadRequestError,
+    anthropic.NotFoundError,
 )
 
 
@@ -311,7 +316,7 @@ def request_corrections(
     return CorrectionBatch.model_validate(parsed).items
 
 
-def rate_limit_delay(error: openai.RateLimitError, attempt: int) -> float:
+def rate_limit_delay(error: openai.RateLimitError | anthropic.RateLimitError, attempt: int) -> float:
     """서버의 재시도 시각을 우선하고 없으면 지수 대기와 무작위 지연을 적용한다."""
     headers = error.response.headers
     for name, divisor in (("retry-after-ms", 1000), ("retry-after", 1)):
@@ -364,7 +369,7 @@ def correct_batch_with_retry(
                 on_log(message)
             else:
                 print(message, file=sys.stderr)
-            if isinstance(error, openai.RateLimitError) and attempt < attempt_limit:
+            if isinstance(error, (openai.RateLimitError, anthropic.RateLimitError)) and attempt < attempt_limit:
                 delay = rate_limit_delay(error, attempt)
                 message = f"[요청 제한] {delay:.1f}초 대기 후 재시도"
                 if on_log:

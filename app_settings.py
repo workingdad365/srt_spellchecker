@@ -54,7 +54,7 @@ class SavedProvider(BaseModel):
 
 
 class Preferences(BaseModel):
-    service: Literal["OpenAI", "OpenRouter"] = "OpenAI"
+    service: Literal["OpenAI", "OpenRouter", "Anthropic"] = "OpenAI"
     models: dict[str, SavedModel] = Field(default_factory=dict)
     openrouter_providers: dict[str, SavedProvider] = Field(default_factory=dict)
     wrap: bool = False

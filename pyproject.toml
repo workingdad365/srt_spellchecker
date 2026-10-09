@@ -1,10 +1,11 @@
 [project]
 name = "srt-spellchecker"
-version = "1.1.7"
-description = "SRT OCR 자막 데스크톱 교정기 (OpenAI / OpenRouter)"
+version = "1.1.8"
+description = "SRT OCR 자막 데스크톱 교정기 (OpenAI / OpenRouter / Anthropic)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "anthropic>=1,<2",
     "openai>=2.0.0",
     "pydantic>=2.11.7",
     "pyside6>=6.11.2",

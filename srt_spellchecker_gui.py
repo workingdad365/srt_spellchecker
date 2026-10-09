@@ -33,7 +33,7 @@ from srt_spellchecker import (
 )
 
 
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 
 
 class TableItemDelegate(QStyledItemDelegate):
@@ -806,7 +806,7 @@ class MainWindow(QMainWindow):
         self._provider_timer.stop()
         self._restoring = True
         self.current_service = service
-        self.preferences.service = "OpenRouter" if service == "OpenRouter" else "OpenAI"
+        self.preferences.service = service
         self.show_key.setChecked(False)
         self.key_edit.setText(self.keys[service])
         self._restore_model()

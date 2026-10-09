@@ -150,7 +150,7 @@ srt-spellchecker
 
 `srt-spellchecker`로 GUI를 실행하며 Windows에서 별도 콘솔 창을 만들지 않는다. 파일 인자와 명령행 교정 옵션은 제공하지 않는다. 파일 추가와 모든 설정은 GUI에서 수행한다.
 
-1. **AI 서비스**에서 OpenAI 또는 OpenRouter를 선택한다.
+1. **AI 서비스**에서 OpenAI, OpenRouter 또는 Anthropic을 선택한다.
 2. **API 키**를 입력하고 **모델 가져오기**를 누른다.
 3. 조회된 모델을 콤보박스에서 선택한다. 모델 ID 일부를 입력해 검색할 수 있다.
 4. **파일 추가**, **폴더 추가** 또는 파일 목록으로 드래그 앤드 드롭하여 대상을 추가한다.
@@ -214,14 +214,15 @@ LLM이 반환한 교정 결과는 빈 응답·빈 줄 예외를 제외하고 원
 
 ## 모델 관련 참고
 
-- OpenAI와 OpenRouter의 모델 목록 API를 호출하며 모델 ID와 OpenRouter 메타데이터를 보존함
+- OpenAI, OpenRouter, Anthropic의 모델 목록 API를 호출하며 모델 ID와 메타데이터를 보존함
+- Anthropic은 공식 SDK의 Messages API를 사용하며 시스템 지시를 별도로 전송함. 프롬프트로 JSON 출력을 요청하고 Pydantic으로 검증함. 추론 설정은 모델 기본값을 사용하고 출력 한도는 요청당 8,192토큰으로 지정함. 출력 한도 도달·거부·빈 응답·잘못된 JSON은 배치 실패로 처리하며 기존 재시도·원문 유지 규칙을 적용함. 프로바이더 설정은 표시하거나 전송하지 않음
 - OpenRouter는 `reasoning.mandatory: false`이면 `reasoning.enabled: false`로 추론을 비활성화함
 - 필수 추론 모델은 `supported_efforts` 중 `minimal`, `low`, `medium`, `high`, `xhigh`, `max` 순서로 지원하는 최저 강도를 선택함
 - `supported_efforts: null`은 모든 강도 허용으로 해석하되 필수 추론 모델에 `none`을 보내지 않음
 - 메타데이터 또는 강도 선택 정보가 없으면 지원 값을 추측하지 않고 모델 기본값을 사용함
 - `exclude: true`는 추론 내용의 응답 제외이며, 자체적으로 추론 비용을 줄이는 옵션은 아님
 - OpenAI 모델 목록에는 추론 지원 강도가 없으므로 GUI에서는 추론 파라미터를 강제하지 않음
-- Chat Completions API를 사용함. OpenRouter는 `structured_outputs` 지원 시 JSON 스키마, `response_format`만 지원하면 JSON 모드, 둘 다 없으면 프롬프트로 JSON을 요청함. 응답은 항상 Pydantic으로 검증함
+- OpenAI와 OpenRouter는 Chat Completions API를 사용함. OpenRouter는 `structured_outputs` 지원 시 JSON 스키마, `response_format`만 지원하면 JSON 모드, 둘 다 없으면 프롬프트로 JSON을 요청함. 응답은 항상 Pydantic으로 검증함
 - OpenAI는 JSON 스키마 구조화 출력을 사용함. 목록에 표시되더라도 선택한 모델이 텍스트 교정·Chat Completions·구조화 출력을 지원하지 않으면 API 오류가 표시될 수 있음
 
 OpenRouter 추론 정책 기준: [Reasoning Tokens](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).

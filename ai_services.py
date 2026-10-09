@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote
 
+import anthropic
 import openai
 
 from srt_spellchecker import CorrectionBatch, check_cancelled
@@ -14,6 +15,7 @@ from srt_spellchecker import CorrectionBatch, check_cancelled
 BASE_URLS = {
     "OpenAI": "https://api.openai.com/v1",
     "OpenRouter": "https://openrouter.ai/api/v1",
+    "Anthropic": "https://api.anthropic.com",
 }
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
@@ -54,11 +56,15 @@ def _client_options(service: str, api_key: str) -> dict[str, Any]:
     )
 
 
-def create_client(service: str, api_key: str) -> openai.OpenAI:
+def create_client(service: str, api_key: str) -> openai.OpenAI | anthropic.Anthropic:
+    if service == "Anthropic":
+        return anthropic.Anthropic(**_client_options(service, api_key))
     return openai.OpenAI(**_client_options(service, api_key))
 
 
-def create_async_client(service: str, api_key: str) -> openai.AsyncOpenAI:
+def create_async_client(service: str, api_key: str) -> openai.AsyncOpenAI | anthropic.AsyncAnthropic:
+    if service == "Anthropic":
+        return anthropic.AsyncAnthropic(**_client_options(service, api_key))
     return openai.AsyncOpenAI(**_client_options(service, api_key))
 
 
@@ -71,12 +77,14 @@ def fetch_models(service: str, api_key: str) -> list[ModelInfo]:
             architecture = metadata.get("architecture") or {}
             if service == "OpenRouter" and "text" not in architecture.get("output_modalities", ["text"]):
                 continue
-            result[model.id] = ModelInfo(model.id, metadata.get("name") or model.id, metadata)
+            result[model.id] = ModelInfo(
+                model.id, metadata.get("name") or metadata.get("display_name") or model.id, metadata,
+            )
     return sorted(result.values(), key=lambda model: model.id.casefold())
 
 
 def fetch_providers(service: str, api_key: str, model: ModelInfo) -> list[ProviderInfo]:
-    if service == "OpenAI":
+    if service in {"OpenAI", "Anthropic"}:
         return []
     if service != "OpenRouter":
         raise ValueError(f"지원하지 않는 서비스: {service}")
@@ -122,7 +130,7 @@ def minimum_reasoning(model: ModelInfo) -> dict[str, Any]:
 
 
 def reasoning_label(service: str, model: ModelInfo) -> str:
-    if service == "OpenAI":
+    if service in {"OpenAI", "Anthropic"}:
         return "모델 기본값"
     policy = minimum_reasoning(model)
     if policy.get("enabled") is False:
@@ -165,7 +173,8 @@ class ServiceCorrector:
 
     async def _request(self, request: dict[str, Any]) -> Any:
         check_cancelled(self.is_cancelled)
-        task = asyncio.create_task(self.client.chat.completions.create(**request))
+        create = self.client.messages.create if self.service == "Anthropic" else self.client.chat.completions.create
+        task = asyncio.create_task(create(**request))
         try:
             while not task.done():
                 check_cancelled(self.is_cancelled)
@@ -179,6 +188,8 @@ class ServiceCorrector:
 
     def invoke(self, messages: list[tuple[str, str]]) -> dict[str, Any]:
         schema = correction_schema()
+        if self.service == "Anthropic":
+            return self._invoke_anthropic(messages, schema)
         request: dict[str, Any] = {
             "model": self.model.id,
             "messages": [
@@ -214,6 +225,27 @@ class ServiceCorrector:
             raise ValueError(f"모델 응답이 완료되지 않았습니다: {choice.finish_reason}")
         content = choice.message.content
         if not content:
+            raise ValueError("모델이 빈 응답을 반환했습니다.")
+        parsed = CorrectionBatch.model_validate_json(content)
+        return {"parsed": parsed, "parsing_error": None}
+
+    def _invoke_anthropic(self, messages: list[tuple[str, str]], schema: dict[str, Any]) -> dict[str, Any]:
+        system = "\n\n".join(text for role, text in messages if role == "system")
+        system += "\nReturn only a JSON object matching this schema, without Markdown fences: " + json.dumps(schema)
+        request = {
+            "model": self.model.id,
+            "max_tokens": 8192,
+            "system": system,
+            "messages": [
+                {"role": "user" if role == "human" else role, "content": text}
+                for role, text in messages if role != "system"
+            ],
+        }
+        response = self._runner.run(self._request(request))
+        if response.stop_reason != "end_turn":
+            raise ValueError(f"모델 응답이 완료되지 않았습니다: {response.stop_reason}")
+        content = "".join(block.text for block in response.content if block.type == "text")
+        if not content.strip():
             raise ValueError("모델이 빈 응답을 반환했습니다.")
         parsed = CorrectionBatch.model_validate_json(content)
         return {"parsed": parsed, "parsing_error": None}
