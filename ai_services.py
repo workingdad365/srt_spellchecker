@@ -239,21 +239,13 @@ class ServiceCorrector:
                 {"role": "user" if role == "human" else role, "content": text}
                 for role, text in messages if role != "system"
             ],
-            "tools": [{
-                "name": "CorrectionBatch",
-                "description": "교정 결과 제출",
-                "input_schema": schema,
-            }],
-            "tool_choice": {"type": "tool", "name": "CorrectionBatch"},
+            "output_config": {"format": {"type": "json_schema", "schema": schema}},
         }
         response = self._runner.run(self._request(request))
-        if response.stop_reason not in {"tool_use", "end_turn"}:
+        if response.stop_reason != "end_turn":
             raise ValueError(f"모델 응답이 완료되지 않았습니다: {response.stop_reason}")
-        tool_inputs = [
-            block.input for block in response.content
-            if block.type == "tool_use" and block.name == "CorrectionBatch"
-        ]
-        if not tool_inputs:
+        content = "".join(block.text for block in response.content if block.type == "text")
+        if not content.strip():
             raise ValueError("모델이 빈 응답을 반환했습니다.")
-        parsed = CorrectionBatch.model_validate(tool_inputs[0])
+        parsed = CorrectionBatch.model_validate_json(content)
         return {"parsed": parsed, "parsing_error": None}

@@ -26,15 +26,10 @@ def install_api(monkeypatch, handler):
     return corrector
 
 
-def response(tool_input=None, stop="tool_use", text=None):
-    if tool_input is None:
-        tool_input = {"items": [{"id": 0, "corrected_lines": ["교정"]}]}
-    content = [{"type": "text", "text": text}] if text is not None else [
-        {"type": "tool_use", "id": "toolu_test", "name": "CorrectionBatch", "input": tool_input},
-    ]
+def response(content='{"items":[{"id":0,"corrected_lines":["교정"]}]}', stop="end_turn"):
     return httpx.Response(200, json={
         "id": "msg_test", "type": "message", "role": "assistant", "model": "claude-test",
-        "content": content, "stop_reason": stop,
+        "content": [{"type": "text", "text": content}], "stop_reason": stop,
         "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 10},
     })
 
@@ -76,10 +71,10 @@ def test_messages_request_and_validation(monkeypatch):
         assert body["system"] == "교정 지시"
         assert body["messages"] == [{"role": "user", "content": "원문"}]
         assert body["max_tokens"] == 8192
-        assert body["tool_choice"] == {"type": "tool", "name": "CorrectionBatch"}
-        assert [tool["name"] for tool in body["tools"]] == ["CorrectionBatch"]
-        assert body["tools"][0]["input_schema"] == services.correction_schema()
-        assert not {"response_format", "provider", "thinking", "temperature"} & body.keys()
+        assert body["output_config"] == {
+            "format": {"type": "json_schema", "schema": services.correction_schema()},
+        }
+        assert not {"response_format", "provider", "thinking", "temperature", "tools", "tool_choice"} & body.keys()
         return response()
 
     corrector = install_api(monkeypatch, handler)
@@ -91,13 +86,13 @@ def test_messages_request_and_validation(monkeypatch):
     assert corrector.client.is_closed()
 
 
-@pytest.mark.parametrize(("tool_input", "stop", "text"), [
-    ({"items": []}, "max_tokens", None), ({"items": []}, "refusal", None),
-    (None, "end_turn", "텍스트 응답"), ({"wrong": []}, "tool_use", None),
-    ({"items": [{"id": 0, "lines": ["교정"]}]}, "tool_use", None),
+@pytest.mark.parametrize(("content", "stop"), [
+    ('{"items":[]}', "max_tokens"), ('{"items":[]}', "refusal"),
+    ("", "end_turn"), ("not json", "end_turn"), ('{"wrong":[]}', "end_turn"),
+    ('{"items":[{"id":0,"lines":["교정"]}]}', "end_turn"),
 ])
-def test_rejects_incomplete_or_invalid_results(monkeypatch, tool_input, stop, text):
-    corrector = install_api(monkeypatch, lambda _: response(tool_input, stop, text))
+def test_rejects_incomplete_or_invalid_results(monkeypatch, content, stop):
+    corrector = install_api(monkeypatch, lambda _: response(content, stop))
     try:
         with pytest.raises(ValueError):
             corrector.invoke([("human", "원문")])
