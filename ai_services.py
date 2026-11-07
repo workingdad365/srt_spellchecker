@@ -231,7 +231,6 @@ class ServiceCorrector:
 
     def _invoke_anthropic(self, messages: list[tuple[str, str]], schema: dict[str, Any]) -> dict[str, Any]:
         system = "\n\n".join(text for role, text in messages if role == "system")
-        system += "\nReturn only a JSON object matching this schema, without Markdown fences: " + json.dumps(schema)
         request = {
             "model": self.model.id,
             "max_tokens": 8192,
@@ -240,12 +239,21 @@ class ServiceCorrector:
                 {"role": "user" if role == "human" else role, "content": text}
                 for role, text in messages if role != "system"
             ],
+            "tools": [{
+                "name": "CorrectionBatch",
+                "description": "교정 결과 제출",
+                "input_schema": schema,
+            }],
+            "tool_choice": {"type": "tool", "name": "CorrectionBatch"},
         }
         response = self._runner.run(self._request(request))
-        if response.stop_reason != "end_turn":
+        if response.stop_reason not in {"tool_use", "end_turn"}:
             raise ValueError(f"모델 응답이 완료되지 않았습니다: {response.stop_reason}")
-        content = "".join(block.text for block in response.content if block.type == "text")
-        if not content.strip():
+        tool_inputs = [
+            block.input for block in response.content
+            if block.type == "tool_use" and block.name == "CorrectionBatch"
+        ]
+        if not tool_inputs:
             raise ValueError("모델이 빈 응답을 반환했습니다.")
-        parsed = CorrectionBatch.model_validate_json(content)
+        parsed = CorrectionBatch.model_validate(tool_inputs[0])
         return {"parsed": parsed, "parsing_error": None}
